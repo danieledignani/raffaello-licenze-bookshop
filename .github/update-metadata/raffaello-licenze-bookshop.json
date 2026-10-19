@@ -6,13 +6,13 @@
   "requires": "5.8",
   "tested": "6.5",
   "requires_php": "7.4",
-  "last_updated": "2026-10-14 00:00:00",
+  "last_updated": "2026-10-19 12:42:41",
   "upgrade_notice": "Aggiornamento automatico da GitHub",
   "author": "Gruppo Raffaello",
   "author_homepage": "https://github.com/danieledignani",
   "sections": {
     "description": "Manda a Raffaello Scuola le licenze RSCU vendute sul Bookshop con License Manager for WooCommerce, per attivarle sul profilo Raffaello Identity di chi compra.",
     "installation": "Carica il plugin tramite il pannello 'Plugin > Aggiungi nuovo' o scompatta nella cartella wp-content/plugins/",
-    "changelog": "<li>Versione iniziale</li>"
+    "changelog": "<li>Versione iniziale</li>\n"
   }
 }
