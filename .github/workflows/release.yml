@@ -1,0 +1,100 @@
+name: Build and release plugin
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and release plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update plugin header version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          sed -i "s/^\(\s*\*\s*Version:\s*\).*/\1$VERSION/" raffaello-licenze-bookshop.php
+          sed -i "s/define('RLB_VERSION', '[^']*')/define('RLB_VERSION', '$VERSION')/" raffaello-licenze-bookshop.php
+
+      - name: Create plugin zip
+        run: |
+          PLUGIN_SLUG="raffaello-licenze-bookshop"
+          ZIP_NAME="${PLUGIN_SLUG}.zip"
+          mkdir dist
+          zip -r "dist/$ZIP_NAME" . -x "*.git*" "*.github*" "vendor/*" "node_modules/*" "dist/*" "*.DS_Store"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: dist/raffaello-licenze-bookshop.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-json:
+    name: Update JSON metadata
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update version in JSON with changelog
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+          JSON_PATH=".github/update-metadata/raffaello-licenze-bookshop.json"
+
+          PREV_TAG=$(git tag --sort=-creatordate | grep -v "$VERSION" | head -n 1)
+          echo "Previous tag: $PREV_TAG"
+
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG=$(git log "$PREV_TAG..HEAD" --pretty=format:"<li>%s</li>" | jq -Rs .)
+          else
+            CHANGELOG=$(echo "<li>Versione iniziale</li>" | jq -Rs .)
+          fi
+
+          cat <<EOF > $JSON_PATH
+          {
+            "name": "Raffaello Licenze — Bookshop",
+            "version": "$VERSION",
+            "download_url": "https://github.com/danieledignani/raffaello-licenze-bookshop/releases/download/$VERSION/raffaello-licenze-bookshop.zip",
+            "homepage": "https://raffaellolibri.it",
+            "requires": "5.8",
+            "tested": "6.5",
+            "requires_php": "7.4",
+            "last_updated": "$TIMESTAMP",
+            "upgrade_notice": "Aggiornamento automatico da GitHub",
+            "author": "Gruppo Raffaello",
+            "author_homepage": "https://github.com/danieledignani",
+            "sections": {
+              "description": "Manda a Raffaello Scuola le licenze RSCU vendute sul Bookshop con License Manager for WooCommerce, per attivarle sul profilo Raffaello Identity di chi compra.",
+              "installation": "Carica il plugin tramite il pannello 'Plugin > Aggiungi nuovo' o scompatta nella cartella wp-content/plugins/",
+              "changelog": $CHANGELOG
+            }
+          }
+          EOF
+
+      - name: Commit updated JSON
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add .github/update-metadata/raffaello-licenze-bookshop.json
+          git commit -m "Update JSON to version $VERSION" || echo "Nessuna modifica da committare."
+          git push origin master
