@@ -98,7 +98,7 @@ class Admin
     public static function action_requeue(): void
     {
         self::guard('rlb_rimetti');
-        self::back('rimessi', ['rlb_n' => Plugin::active() ? Sender::requeue_failed() : 0]);
+        self::back('rimessi', ['rlb_n' => Plugin::active() ? Sender::requeue() : 0]);
     }
 
     public static function action_confirm(): void
@@ -198,8 +198,8 @@ class Admin
                 esc_html($v['testo'])
             );
             self::order_links($v);
-            if ($v['id'] === 'B6' && $v['ordini']) {
-                self::button('rlb_rimetti', __('Rimetti in coda gli invii falliti', 'raffaello-licenze-bookshop'));
+            if (in_array($v['id'], ['B6', 'B15'], true) && $v['ordini']) {
+                self::button('rlb_rimetti', __('Rimetti in coda gli invii falliti e interrotti', 'raffaello-licenze-bookshop'));
             }
             if (isset($v['conferma'])) {
                 self::button('rlb_conferma', __('Ho verificato l\'esclusione delle RSCU nello snippet GreenBubble', 'raffaello-licenze-bookshop'), ['hash' => $v['conferma']]);
@@ -297,7 +297,7 @@ class Admin
             echo '<p><strong>' . esc_html(sprintf(__('Ultima prova: %1$s verso %2$s.', 'raffaello-licenze-bookshop'), Checks::date($ping['quando']), $ping['destinazione'])) . '</strong> ';
             if ($riuscita) {
                 /* translators: 1: versione, 2: SKU inviati */
-                echo esc_html(sprintf(__('Riuscita: Raffaello Scuola %1$s, %2$d SKU confrontati.', 'raffaello-licenze-bookshop'), $ping['versione'], $ping['sku_inviati']));
+                echo esc_html(sprintf(_n('Riuscita: Raffaello Scuola %1$s, %2$d SKU confrontato.', 'Riuscita: Raffaello Scuola %1$s, %2$d SKU confrontati.', $ping['sku_inviati'], 'raffaello-licenze-bookshop'), $ping['versione'], $ping['sku_inviati']));
                 if ($ping['sku_sconosciuti']) {
                     /* translators: %s: elenco di SKU */
                     echo ' ' . esc_html(sprintf(__('SKU sconosciuti a Scuola: %s.', 'raffaello-licenze-bookshop'), implode(', ', $ping['sku_sconosciuti'])));

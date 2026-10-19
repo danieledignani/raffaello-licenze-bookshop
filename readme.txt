@@ -4,7 +4,7 @@ Tags: licenze, license manager, woocommerce, raffaello scuola, identity
 Requires at least: 5.8
 Tested up to: 6.5
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 
 Manda a Raffaello Scuola le licenze RSCU vendute sul Bookshop con License Manager for WooCommerce, per attivarle sul profilo Raffaello Identity di chi compra.
@@ -32,6 +32,16 @@ Istruzioni complete per installazione, configurazione, go-live e assistenza nel 
 * Raffaello Licenze su Raffaello Scuola: 1.5.0 per gli invii, 1.5.1 o successiva per la prova di connessione.
 
 == Changelog ==
+
+= 1.0.1 =
+* Esiti, stati e tentativi in chiavi separate per evento (_rscu_esito_<evento>, _rscu_stato_<evento>, _rscu_tentativi_<evento>, con evento licenze_assegnate o licenze_revocate): ogni invio scrive solo le sue, così assegnazione e revoca dello stesso ordine non si sovrascrivono anche con più batch di Action Scheduler insieme. Le chiavi della 1.0.0 (_rscu_esito, _rscu_stato, _rscu_tentativi) non si leggono più: nessuna migrazione, perché la 1.0.0 ha girato solo sul Bookshop dev con un ordine di prova.
+* Invii falliti e ordini da sistemare cercati sulle chiavi nuove (per un ordine revocato conta la revoca), con HPOS e con l'archivio ordini classico su post: lì WooCommerce ignora la meta_query, e la aggiunge il plugin con il filtro woocommerce_order_data_store_cpt_get_orders_query.
+* Un invio per ordine alla volta, per tutti e due gli eventi: lock del database (GET_LOCK rlb_ordine_<id>, rilasciato anche su errore); con il lock occupato l'invio si riprova fra un minuto senza consumare tentativi; se il lock non si può prendere (errore del database) o il nuovo tentativo non si programma, l'azione fallisce con un errore nel log, senza toccare l'ordine. Dopo il lock le meta dell'ordine si rileggono dal database. Requisito: un solo server MySQL/MariaDB.
+* Nuovo controllo B15 "Invii interrotti": azioni di Action Scheduler fallite (errore fatale, timeout, lock del database) con l'ordine ancora in coda e nessuna altra azione in attesa o in esecuzione per lo stesso ordine ed evento; bloccante, li conta tutti e ne elenca 50 con i link; "Rimetti in coda gli invii falliti e interrotti" li riprende tutti insieme ai falliti.
+* B5 torna a controllare solo gli invii in ritardo.
+* Nota del rimborso parziale: revocare l'attivazione dei codici già riscattati e disattivare quelli ancora liberi.
+* README: go-live con i prodotti RSCU non acquistabili fino alla prova finale, fatta con un prodotto di prova dedicato e un utente non amministratore e seguita dalla prova di un pagamento vero; monitoraggio di B6, B14 e B15 (azioni fallite conservate 3 mesi); quali errori consumano tentativi; cache su Raffaello Scuola (prima e dopo una revoca); cliente senza sub; rimborso parziale.
+* Testi: singolare nelle note ("1 licenza in 1 invio") e nei conteggi; B11 senza prodotti RSCU pubblicati dice che non c'è niente da confrontare; nel README la riga di esclusione per GreenBubble va prima della riga che assegna $is_rlab.
 
 = 1.0.0 =
 * Prima versione come plugin, dallo snippet "Raffaello Scuola: licenze RSCU": stessa fotografia delle licenze, stesso hook cumulativo, lotti da 50 licenze e 64 KB, coda Action Scheduler, revoca registrata anche prima della fotografia, solo ordini con prodotti licenziati, azione "Reinvia"; stesse meta d'ordine e stessa azione in coda.

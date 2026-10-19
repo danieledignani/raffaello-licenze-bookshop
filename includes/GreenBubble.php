@@ -155,7 +155,12 @@ class GreenBubble
         if ($rilevato && (!$conferma || $conferma['quando'] <= $rilevato['quando'])) {
             $voce = Checks::ko('B13', $titolo, 'bloccante', sprintf(
                 /* translators: 1: numero di ordini, 2: data */
-                __('Licenze RSCU registrate anche dallo snippet GreenBubble in %1$d ordini (l\'ultimo il %2$s): GreenBubble non le esclude e potrebbe averle mandate a Raffaello Digitale. Aggiungi la riga di esclusione (README), poi conferma la verifica.', 'raffaello-licenze-bookshop'),
+                _n(
+                    'Licenze RSCU registrate anche dallo snippet GreenBubble in %1$d ordine (del %2$s): GreenBubble non le esclude e potrebbe averle mandate a Raffaello Digitale. Aggiungi la riga di esclusione (README), poi conferma la verifica.',
+                    'Licenze RSCU registrate anche dallo snippet GreenBubble in %1$d ordini (l\'ultimo il %2$s): GreenBubble non le esclude e potrebbe averle mandate a Raffaello Digitale. Aggiungi la riga di esclusione (README), poi conferma la verifica.',
+                    count($rilevato['ordini']),
+                    'raffaello-licenze-bookshop'
+                ),
                 count($rilevato['ordini']),
                 Checks::date($rilevato['quando'])
             ), $rilevato['ordini']);

@@ -21,6 +21,8 @@ class Plugin
     {
         load_plugin_textdomain('raffaello-licenze-bookshop', false, dirname(RLB_PLUGIN_BASENAME) . '/languages');
 
+        // Anche a plugin fermo: la checklist cerca gli ordini, e sull'archivio classico serve il filtro.
+        add_filter('woocommerce_order_data_store_cpt_get_orders_query', [Sender::class, 'cpt_query'], 10, 2);
         if (self::active()) {
             Sender::register();
             GreenBubble::register();

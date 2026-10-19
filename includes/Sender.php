@@ -2,6 +2,8 @@
 
 namespace RaffaelloLicenzeBookshop;
 
+use Automattic\WooCommerce\Utilities\OrderUtil;
+
 if (!defined('ABSPATH')) {
     exit;
 }
@@ -18,21 +20,25 @@ if (!defined('ABSPATH')) {
  *   su 429 e 5xx. Senza configurazione l'invio aspetta, senza consumare tentativi.
  * - Rimborso totale o annullamento: accoda la revoca di tutte le licenze RSCU,
  *   anche di quelle assegnate dopo.
- * - Esito per ordine: meta _rscu_esito (per evento) e _rscu_stato (per le
- *   ricerche): in_coda, inviato, attivato, da_sistemare, fallito.
+ * - Esito, stato e tentativi in chiavi separate per evento (_rscu_esito_<evento>,
+ *   _rscu_stato_<evento>, _rscu_tentativi_<evento>): ogni job scrive solo le sue,
+ *   così assegnazione e revoca dello stesso ordine non si sovrascrivono anche con
+ *   più batch di Action Scheduler insieme. Stati: in_coda, inviato, attivato,
+ *   da_sistemare, fallito.
  *
- * Meta, azione e gruppo di Action Scheduler sono quelli dello snippet che il
- * plugin sostituisce: ordini già fotografati e invii in coda passano al plugin.
+ * Fotografia (_rscu_licenze, _rscu_cliente), _rscu_revocato, azione e gruppo di
+ * Action Scheduler sono quelli dello snippet che il plugin sostituisce.
  */
 class Sender
 {
     const PREFISSO = 'RSCU';
     const META_LICENZE = '_rscu_licenze';
     const META_CLIENTE = '_rscu_cliente';
-    const META_TENTATIVI = '_rscu_tentativi';
+    const META_TENTATIVI = '_rscu_tentativi_';
     const META_REVOCATO = '_rscu_revocato';
-    const META_ESITO = '_rscu_esito';
-    const META_STATO = '_rscu_stato';
+    // Prefissi: la chiave è il prefisso seguito dall'evento (licenze_assegnate, licenze_revocate).
+    const META_ESITO = '_rscu_esito_';
+    const META_STATO = '_rscu_stato_';
     const AZIONE = 'rscu_invia_licenze';
     const GRUPPO = 'raffaello-scuola';
 
@@ -155,10 +161,7 @@ class Sender
         } elseif (as_get_scheduled_actions(['hook' => self::AZIONE, 'args' => $args, 'group' => self::GRUPPO, 'status' => 'pending', 'per_page' => 1], 'ids')) {
             return;
         }
-        $tentativi = $order->get_meta(self::META_TENTATIVI);
-        $tentativi = is_array($tentativi) ? $tentativi : [];
-        $tentativi[$evento] = 0;
-        $order->update_meta_data(self::META_TENTATIVI, $tentativi);
+        $order->update_meta_data(self::META_TENTATIVI . $evento, 0);
         self::segna($order, $evento, 'in_coda', [], 'in coda per l\'invio');
         $order->save();
         self::programma($order, $evento, self::ATTESE[0]);
@@ -177,14 +180,50 @@ class Sender
     }
 
     /**
-     * Job di Action Scheduler: un tentativo di invio dei dati fotografati, a lotti
-     * uno dopo l'altro. Riesce solo se riescono tutti; al tentativo successivo si
-     * rimanda tutto, tanto l'endpoint è idempotente.
+     * Job di Action Scheduler. Un invio per ordine alla volta, per tutti e due gli eventi:
+     * con il lock di MySQL (un solo server di database), perché la deduplica di accoda()
+     * guarda solo gli invii in attesa e non quello in esecuzione.
      */
     public static function invia($order_id, $evento): void
     {
+        global $wpdb;
+        $order_id = (int) $order_id;
+        $lock = 'rlb_ordine_' . $order_id;
+        $preso = $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, 0)', $lock));
+        // Senza lock non si scrive niente sull'ordine: un errore fa fallire l'azione di Action
+        // Scheduler, e l'ordine resta in coda senza job, cioè fra gli "invii interrotti" della checklist (B15).
+        if ($preso === null) {
+            Log::write('error', sprintf('Ordine %d, %s: lock del database non disponibile, invio non eseguito.', $order_id, $evento));
+            throw new \RuntimeException(sprintf('Invio dell\'ordine %d non eseguito: lock del database non disponibile.', $order_id));
+        }
+        if ((string) $preso !== '1') {
+            // Ordine già in invio: si riprova fra un minuto, senza consumare tentativi e senza nota.
+            if (!as_schedule_single_action(time() + 60, self::AZIONE, [$order_id, $evento], self::GRUPPO)) {
+                Log::write('error', sprintf('Ordine %d, %s: ordine già in invio e nuovo tentativo non programmato.', $order_id, $evento));
+                throw new \RuntimeException(sprintf('Invio dell\'ordine %d non riprogrammato.', $order_id));
+            }
+            return;
+        }
+        try {
+            self::invia_ordine($order_id, $evento);
+        } finally {
+            $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock));
+        }
+    }
+
+    /**
+     * Un tentativo di invio dei dati fotografati, a lotti uno dopo l'altro. Riesce solo
+     * se riescono tutti; al tentativo successivo si rimanda tutto, tanto l'endpoint è idempotente.
+     */
+    private static function invia_ordine(int $order_id, string $evento): void
+    {
         $order = wc_get_order($order_id);
-        $licenze = $order ? $order->get_meta(self::META_LICENZE) : null;
+        if (!$order) {
+            return;
+        }
+        // Dopo il lock si legge dal DB: questo processo può avere le meta in cache da un job precedente.
+        $order->read_meta_data(true);
+        $licenze = $order->get_meta(self::META_LICENZE);
         if (!is_array($licenze) || !$licenze) {
             return;
         }
@@ -206,11 +245,8 @@ class Sender
             return;
         }
 
-        $tentativi = $order->get_meta(self::META_TENTATIVI);
-        $tentativi = is_array($tentativi) ? $tentativi : [];
-        $tentativo = (int) ($tentativi[$evento] ?? 0) + 1;
-        $tentativi[$evento] = $tentativo;
-        $order->update_meta_data(self::META_TENTATIVI, $tentativi);
+        $tentativo = (int) $order->get_meta(self::META_TENTATIVI . $evento) + 1;
+        $order->update_meta_data(self::META_TENTATIVI . $evento, $tentativo);
         $order->save();
 
         $base = [
@@ -245,7 +281,7 @@ class Sender
             }
             self::segna($order, $evento, 'fallito', [$risposta['codice']], sprintf('tentativo %d: %s', $tentativo, $motivo));
             $order->save();
-            $order->add_order_note(sprintf('Raffaello Scuola, %s fallita definitivamente al tentativo %d (%s). Usa l\'azione "Reinvia licenze a Raffaello Scuola" o "Rimetti in coda gli invii falliti" in WooCommerce > Raffaello Scuola.', $azione, $tentativo, $motivo));
+            $order->add_order_note(sprintf('Raffaello Scuola, %s fallita definitivamente al tentativo %d (%s). Usa l\'azione "Reinvia licenze a Raffaello Scuola" o "Rimetti in coda gli invii falliti e interrotti" in WooCommerce > Raffaello Scuola.', $azione, $tentativo, $motivo));
             return;
         }
         self::ricorda($config, 'ok', 'HTTP 200', $order->get_id());
@@ -270,10 +306,11 @@ class Sender
             $stato = 'inviato';
         }
         $nota = sprintf(
-            'Raffaello Scuola, %s %s (%d licenze in %d %s): %s.',
+            'Raffaello Scuola, %s %s (%d %s in %d %s): %s.',
             $azione,
             $motivi ? 'da sistemare' : 'riuscita',
             count($licenze),
+            count($licenze) === 1 ? 'licenza' : 'licenze',
             count($lotti),
             count($lotti) === 1 ? 'invio' : 'invii',
             implode('; ', $righe)
@@ -365,18 +402,15 @@ class Sender
     /** Esito di un evento dell'ordine: stato, motivi, dettaglio, quando; [] se non c'è. */
     public static function esito(\WC_Order $order, string $evento): array
     {
-        $esito = $order->get_meta(self::META_ESITO);
-        return is_array($esito[$evento] ?? null) ? $esito[$evento] : [];
+        $esito = $order->get_meta(self::META_ESITO . $evento);
+        return is_array($esito) ? $esito : [];
     }
 
+    /** Solo le chiavi dell'evento: WooCommerce salva solo le meta cambiate, quelle dell'altro job restano sue. */
     private static function segna(\WC_Order $order, string $evento, string $stato, array $motivi, string $dettaglio): void
     {
-        $esito = $order->get_meta(self::META_ESITO);
-        $esito = is_array($esito) ? $esito : [];
-        $esito[$evento] = ['stato' => $stato, 'motivi' => $motivi, 'dettaglio' => $dettaglio, 'quando' => time()];
-        $order->update_meta_data(self::META_ESITO, $esito);
-        // Per un ordine revocato conta la revoca: revocate le licenze, l'esito dell'assegnazione non serve più.
-        $order->update_meta_data(self::META_STATO, ($esito['licenze_revocate'] ?? $esito['licenze_assegnate'])['stato']);
+        $order->update_meta_data(self::META_ESITO . $evento, ['stato' => $stato, 'motivi' => $motivi, 'dettaglio' => $dettaglio, 'quando' => time()]);
+        $order->update_meta_data(self::META_STATO . $evento, $stato);
     }
 
     /** Esito dell'ultimo invio vero, per la checklist. */
@@ -385,25 +419,76 @@ class Sender
         update_option(self::OPTION_ULTIMO, ['quando' => time(), 'codice' => $codice, 'testo' => $testo, 'ordine' => $order_id, 'impronta' => $config['impronta']], false);
     }
 
-    /** Ultimi 50 ordini nello stato dato, dal più recente, con il totale (->orders, ->total). */
+    /**
+     * Ultimi 50 ordini nello stato dato, dal più recente, con il totale (->orders, ->total).
+     * Per un ordine revocato conta la revoca: revocate le licenze, l'assegnazione non serve più.
+     */
     public static function orders(string $stato)
     {
-        return wc_get_orders([
-            'type'       => 'shop_order',
-            'limit'      => 50,
-            'orderby'    => 'date',
-            'order'      => 'DESC',
-            'return'     => 'ids',
-            'paginate'   => true,
-            'meta_key'   => self::META_STATO,
-            'meta_value' => $stato,
-        ]);
+        $meta_query = [
+            'relation' => 'OR',
+            ['key' => self::META_STATO . 'licenze_revocate', 'value' => $stato],
+            [
+                'relation' => 'AND',
+                ['key' => self::META_STATO . 'licenze_assegnate', 'value' => $stato],
+                ['key' => self::META_STATO . 'licenze_revocate', 'compare' => 'NOT EXISTS'],
+            ],
+        ];
+        return self::search($meta_query, 50, 'DESC');
     }
 
-    /** Rimette in coda gli ultimi 50 ordini falliti; restituisce quanti. */
-    public static function requeue_failed(): int
+    /**
+     * Ordini con un invio interrotto: un'azione di Action Scheduler fallita (errore fatale,
+     * timeout segnato da Action Scheduler, lock del database) con l'evento ancora in coda e
+     * nessuna azione in attesa o in esecuzione per la stessa coppia ordine ed evento.
+     * Le azioni fallite di solito sono zero; Action Scheduler le tiene 3 mesi.
+     */
+    public static function stuck(): array
     {
-        $ids = self::orders('fallito')->orders;
+        $interrotti = [];
+        foreach (as_get_scheduled_actions(['hook' => self::AZIONE, 'group' => self::GRUPPO, 'status' => 'failed', 'per_page' => -1]) as $azione) {
+            $args = $azione->get_args();
+            $order = wc_get_order($args[0]);
+            if ($order && (self::esito($order, $args[1])['stato'] ?? '') === 'in_coda'
+                && !as_get_scheduled_actions(['hook' => self::AZIONE, 'args' => $args, 'group' => self::GRUPPO, 'status' => ['pending', 'in-progress'], 'per_page' => 1], 'ids')) {
+                $interrotti[] = (int) $args[0];
+            }
+        }
+        // Più azioni fallite per la stessa coppia, o i due eventi dello stesso ordine: un ordine solo.
+        return array_values(array_unique($interrotti));
+    }
+
+    /** Ricerca di ordini per meta, con il totale (->orders, ->total), su HPOS e sull'archivio classico. */
+    private static function search(array $meta_query, int $limit, string $verso)
+    {
+        $args = [
+            'type'     => 'shop_order',
+            'limit'    => $limit,
+            'orderby'  => 'date',
+            'order'    => $verso,
+            'return'   => 'ids',
+            'paginate' => true,
+        ];
+        // HPOS accetta meta_query; l'archivio classico (post) la ignora e restituirebbe tutti gli
+        // ordini: lì la aggiunge cpt_query() da una variabile nostra.
+        $hpos = class_exists(OrderUtil::class) && OrderUtil::custom_orders_table_usage_is_enabled();
+        $args[$hpos ? 'meta_query' : 'rlb_stato'] = $meta_query;
+        return wc_get_orders($args);
+    }
+
+    /** Archivio ordini classico (post): la meta_query di search() passa da qui. */
+    public static function cpt_query($wp_query_args, $query_vars)
+    {
+        if (isset($query_vars['rlb_stato'])) {
+            $wp_query_args['meta_query'][] = $query_vars['rlb_stato'];
+        }
+        return $wp_query_args;
+    }
+
+    /** Rimette in coda gli ultimi 50 ordini falliti e tutti quelli con un invio interrotto; restituisce quanti. */
+    public static function requeue(): int
+    {
+        $ids = array_unique(array_merge(self::orders('fallito')->orders, self::stuck()));
         foreach ($ids as $id) {
             $order = wc_get_order($id);
             if ($order) {
@@ -471,7 +556,7 @@ class Sender
     {
         $order = wc_get_order($order_id);
         if ($order && $order->get_meta(self::META_LICENZE)) {
-            $order->add_order_note('Rimborso parziale: revocare a mano su Raffaello Scuola le licenze interessate (Licenze > Attivazioni, ricerca per ordine).');
+            $order->add_order_note('Rimborso parziale: su Raffaello Scuola, per le licenze rimborsate, revocare l\'attivazione dei codici già riscattati (Licenze > Attivazioni, ricerca per ordine) e disattivare quelli ancora liberi (Licenze > Codici), altrimenti restano riscattabili.');
         }
     }
 }

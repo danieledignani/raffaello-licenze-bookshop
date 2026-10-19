@@ -7,7 +7,7 @@ if (!defined('ABSPATH')) {
 }
 
 /**
- * Checklist di configurazione (controlli B1-B14 del go-live, più dipendenze e
+ * Checklist di configurazione (controlli B1-B14 del go-live, B15 sugli invii interrotti, dipendenze e
  * vecchio snippet). La stessa lista alimenta la pagina Impostazioni, l'avviso
  * in admin (solo i bloccanti) e Salute del sito. Nessuna chiamata HTTP: il
  * collegamento si legge dall'ultima prova o dall'ultimo invio.
@@ -34,6 +34,7 @@ class Checks
             self::http_esterno($config),
             self::coda(),
             self::falliti(),
+            self::interrotti(),
             self::license_manager(),
             self::consegna(),
             self::generatore($generatori),
@@ -212,10 +213,6 @@ class Checks
         if ($in_ritardo) {
             return self::ko('B5', $titolo, 'bloccante', __('Ci sono invii in attesa da più di 30 minuti: Action Scheduler non sta girando (WP-Cron fermo?). Guarda WooCommerce > Stato > Azioni programmate, gruppo raffaello-scuola.', 'raffaello-licenze-bookshop'));
         }
-        // Il default è 1: un batch alla volta, quindi gli invii dello stesso ordine non si sovrappongono.
-        if (apply_filters('action_scheduler_queue_runner_concurrent_batches', 1) > 1) {
-            return self::ko('B5', $titolo, 'attenzione', __('Action Scheduler esegue più batch insieme (filtro action_scheduler_queue_runner_concurrent_batches): assegnazione e revoca dello stesso ordine possono sovrascrivere l\'una l\'esito dell\'altra, e una revoca fallita può sparire dagli invii falliti. Nessun invio in ritardo.', 'raffaello-licenze-bookshop'));
-        }
         return self::ok('B5', $titolo, __('Nessun invio in ritardo.', 'raffaello-licenze-bookshop'));
     }
 
@@ -228,9 +225,24 @@ class Checks
         }
         return self::ko('B6', $titolo, 'bloccante', sprintf(
             /* translators: %d: numero di ordini */
-            _n('%d ordine con invio fallito definitivamente: correggi la causa (nota d\'ordine) e usa "Rimetti in coda gli invii falliti".', '%d ordini con invio fallito definitivamente: correggi la causa (note d\'ordine) e usa "Rimetti in coda gli invii falliti".', $falliti->total, 'raffaello-licenze-bookshop'),
+            _n('%d ordine con invio fallito definitivamente: correggi la causa (nota d\'ordine) e usa "Rimetti in coda gli invii falliti e interrotti".', '%d ordini con invio fallito definitivamente: correggi la causa (note d\'ordine) e usa "Rimetti in coda gli invii falliti e interrotti".', $falliti->total, 'raffaello-licenze-bookshop'),
             $falliti->total
         ), $falliti->orders);
+    }
+
+    /** B15: azioni di Action Scheduler fallite con l'ordine ancora in coda; in pagina i primi 50. */
+    private static function interrotti(): array
+    {
+        $titolo = __('Invii interrotti', 'raffaello-licenze-bookshop');
+        $ordini = Sender::stuck();
+        if (!$ordini) {
+            return self::ok('B15', $titolo, __('Nessuno.', 'raffaello-licenze-bookshop'));
+        }
+        return self::ko('B15', $titolo, 'bloccante', sprintf(
+            /* translators: %d: numero di ordini */
+            _n('%d ordine con un invio interrotto: l\'azione di Action Scheduler è fallita (per esempio per un errore fatale, un timeout o il lock del database) e l\'ordine è ancora in coda. Usa "Rimetti in coda gli invii falliti e interrotti".', '%d ordini con un invio interrotto: l\'azione di Action Scheduler è fallita (per esempio per un errore fatale, un timeout o il lock del database) e l\'ordine è ancora in coda. Usa "Rimetti in coda gli invii falliti e interrotti".', count($ordini), 'raffaello-licenze-bookshop'),
+            count($ordini)
+        ), array_slice($ordini, 0, 50));
     }
 
     private static function license_manager(): array
@@ -366,12 +378,19 @@ class Checks
         if (!$ping || $ping['codice'] !== 'ok') {
             return self::nv('B11', $titolo, 'informativo', __('Si verifica con una "Prova connessione" riuscita.', 'raffaello-licenze-bookshop'));
         }
+        if (!$ping['sku_inviati']) {
+            return self::nv('B11', $titolo, 'informativo', __('Nessun prodotto RSCU pubblicato da confrontare.', 'raffaello-licenze-bookshop'));
+        }
         if ($ping['sku_sconosciuti']) {
             /* translators: %s: elenco di SKU */
             return self::ko('B11', $titolo, 'bloccante', sprintf(__('Raffaello Scuola non ha una licenza attiva per: %s. Chi compra questi prodotti resta in attesa di configurazione: crea su Scuola le licenze con lo stesso SKU, poi ripeti la prova.', 'raffaello-licenze-bookshop'), implode(', ', $ping['sku_sconosciuti'])));
         }
-        /* translators: 1: numero di SKU, 2: data */
-        return self::ok('B11', $titolo, sprintf(__('Tutti i %1$d SKU dei prodotti pubblicati (prova del %2$s).', 'raffaello-licenze-bookshop'), $ping['sku_inviati'], self::date($ping['quando'])));
+        return self::ok('B11', $titolo, sprintf(
+            /* translators: 1: numero di SKU, 2: data */
+            _n('Lo SKU del prodotto pubblicato è configurato su Scuola (prova del %2$s).', 'I %1$d SKU dei prodotti pubblicati sono configurati su Scuola (prova del %2$s).', $ping['sku_inviati'], 'raffaello-licenze-bookshop'),
+            $ping['sku_inviati'],
+            self::date($ping['quando'])
+        ));
     }
 
     private static function identity(): array

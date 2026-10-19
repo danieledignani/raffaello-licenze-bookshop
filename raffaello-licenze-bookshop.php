@@ -3,7 +3,7 @@
  * Plugin Name: Raffaello Licenze — Bookshop
  * Plugin URI: https://raffaellolibri.it
  * Description: Manda a Raffaello Scuola le licenze RSCU vendute sul Bookshop con License Manager for WooCommerce: attivazione sul profilo di Raffaello Identity, revoca a rimborso o annullamento, impostazioni del collegamento, prova di connessione e controlli di configurazione.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Gruppo Raffaello
  * Text Domain: raffaello-licenze-bookshop
  * Domain Path: /languages
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('RLB_VERSION', '1.0.0');
+define('RLB_VERSION', '1.0.1');
 define('RLB_PLUGIN_FILE', __FILE__);
 define('RLB_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('RLB_PLUGIN_BASENAME', plugin_basename(__FILE__));
