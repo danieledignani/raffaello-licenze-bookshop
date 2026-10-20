@@ -4,7 +4,7 @@ Tags: licenze, license manager, woocommerce, raffaello scuola, identity
 Requires at least: 5.8
 Tested up to: 6.5
 Requires PHP: 7.4
-Stable tag: 1.0.2
+Stable tag: 1.0.3
 License: GPLv2 or later
 
 Manda a Raffaello Scuola le licenze RSCU vendute sul Bookshop con License Manager for WooCommerce, per attivarle sul profilo Raffaello Identity di chi compra.
@@ -33,6 +33,10 @@ Istruzioni complete per installazione, configurazione, go-live e assistenza nel 
 * Raffaello Licenze su Raffaello Scuola: 1.5.0 per gli invii, 1.5.1 o successiva per la prova di connessione.
 
 == Changelog ==
+
+= 1.0.3 =
+* Corretto: la riconciliazione oraria non finiva mai su un archivio ordini grande. La sua ricerca metteva in OR condizioni su meta diverse, e WooCommerce (HPOS e archivio classico) unisce le meta di "=" ed EXISTS solo per ordine: l'OR moltiplicava fra loro tutte le meta di ogni ordine. Sul Bookshop dev, con 71.000 ordini, ogni giro restava in esecuzione e Action Scheduler lo segnava fallito dopo 5 minuti; il giro dopo partiva alla prima pagina di amministrazione. Ora sono quattro ricerche in AND, una per caso, che usano gli indici delle meta; gli id si uniscono e si scorrono 250 per giro con un cursore sull'ultimo ordine visto (opzione rlb_riconciliazione_cursore al posto di rlb_riconciliazione_pagina). Su MariaDB 11.8 con 71.000 ordini e 817.000 meta di prova la ricerca vecchia non finisce in 60 secondi; le quattro nuove, insieme, in meno di un secondo.
+* Corretto: lo stesso per gli invii falliti (B6) e gli ordini da sistemare (B14), che la pagina del plugin calcola a ogni apertura e l'avviso in admin al più ogni 5 minuti: due ricerche in AND, una per evento, con i totali sommati. Sugli stessi dati da 16 secondi a meno di uno.
 
 = 1.0.2 =
 * Fotografia delle licenze sotto un lock breve per ordine (GET_LOCK <prefisso>rlb_foto_<id>, attesa massima 10 secondi; senza lock si fotografa lo stesso con un avviso nel log): rilettura delle meta, unione, salvataggio. Lo stesso lock in ordine_revocato attorno a marcatore, rilettura e decisione.

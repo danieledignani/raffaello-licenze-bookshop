@@ -51,7 +51,8 @@ class Sender
     // Riconciliazione: ogni ora riprende gli invii rimasti in coda senza job (al massimo 3 volte).
     const RICONCILIA = 'rlb_riconcilia';
     const OPTION_RICONCILIA = 'rlb_riconciliazione';
-    const OPTION_PAGINA = 'rlb_riconciliazione_pagina';
+    // Ultimo ordine visto dal giro precedente.
+    const OPTION_CURSORE = 'rlb_riconciliazione_cursore';
     const MAX_RIPRESE = 3;
 
     /** Repository delle licenze di License Manager 3.0.20 (findAllBy, come prima del suo hook). */
@@ -521,19 +522,19 @@ class Sender
     /**
      * Ultimi 50 ordini nello stato dato, dal più recente, con il totale (->orders, ->total).
      * Per un ordine revocato conta la revoca: revocate le licenze, l'assegnazione non serve più.
+     * Una ricerca per evento, perché search() non accetta OR.
      */
     public static function orders(string $stato)
     {
-        $meta_query = [
-            'relation' => 'OR',
-            ['key' => self::META_STATO . 'licenze_revocate', 'value' => $stato],
-            [
-                'relation' => 'AND',
-                ['key' => self::META_STATO . 'licenze_assegnate', 'value' => $stato],
-                ['key' => self::META_STATO . 'licenze_revocate', 'compare' => 'NOT EXISTS'],
-            ],
-        ];
-        return self::search($meta_query, 50, 'DESC');
+        $revoca = self::search([['key' => self::META_STATO . 'licenze_revocate', 'value' => $stato]], 50, 'DESC');
+        $assegnazione = self::search([
+            ['key' => self::META_STATO . 'licenze_assegnate', 'value' => $stato],
+            ['key' => self::META_STATO . 'licenze_revocate', 'compare' => 'NOT EXISTS'],
+        ], 50, 'DESC');
+        // Le due ricerche non hanno ordini in comune (con e senza lo stato della revoca): i totali si sommano.
+        $ids = array_merge($revoca->orders, $assegnazione->orders);
+        rsort($ids);
+        return (object) ['orders' => array_slice($ids, 0, 50), 'total' => $revoca->total + $assegnazione->total];
     }
 
     /** Programma la riconciliazione oraria, se manca (anche dopo che qualcuno l'ha cancellata). */
@@ -550,37 +551,45 @@ class Sender
      * interrotto da un errore fatale o un timeout, lock del database), e le fotografie o le
      * revoche rimaste senza stato in un ordine di più di 30 minuti (salvataggio interrotto a
      * metà, ordini dello snippet). Dopo 3 riprese l'evento risulta fallito (motivo "interrotto").
-     * A pagine di 250 ordini, cioè al massimo 500 coppie per giro: la pagina dopo al giro dopo,
-     * poi si ricomincia.
+     * 250 ordini per giro, cioè al massimo 500 coppie, in ordine di id: il giro dopo riparte
+     * dall'ordine successivo all'ultimo visto e, finito l'elenco, dal primo.
      */
     public static function riconcilia(): void
     {
-        $pagina = max(1, (int) get_option(self::OPTION_PAGINA, 1));
-        $da_riprendere = [
-            'relation' => 'OR',
-            ['key' => self::META_STATO . 'licenze_assegnate', 'value' => 'in_coda'],
-            ['key' => self::META_STATO . 'licenze_revocate', 'value' => 'in_coda'],
+        // Una ricerca per caso, perché search() non accetta OR.
+        $casi = [
+            [['key' => self::META_STATO . 'licenze_assegnate', 'value' => 'in_coda']],
+            [['key' => self::META_STATO . 'licenze_revocate', 'value' => 'in_coda']],
+            // Fotografia senza stato.
             [
-                'relation' => 'AND',
                 ['key' => self::META_LICENZE, 'compare' => 'EXISTS'],
                 ['key' => self::META_STATO . 'licenze_assegnate', 'compare' => 'NOT EXISTS'],
             ],
+            // Revoca senza stato.
             [
-                'relation' => 'AND',
                 ['key' => self::META_REVOCATO, 'compare' => 'EXISTS'],
                 ['key' => self::META_LICENZE, 'compare' => 'EXISTS'],
                 ['key' => self::META_STATO . 'licenze_revocate', 'compare' => 'NOT EXISTS'],
             ],
         ];
-        $trovati = self::search($da_riprendere, 250, 'ASC', $pagina);
-        // Pagina vuota perché nel frattempo gli ordini da riprendere sono diminuiti: subito dalla prima.
-        if ($pagina > 1 && !$trovati->orders && $trovati->total) {
-            $pagina = 1;
-            $trovati = self::search($da_riprendere, 250, 'ASC', $pagina);
+        $ids = [];
+        foreach ($casi as $condizioni) {
+            $ids = array_merge($ids, self::search($condizioni, -1, 'ASC')->orders);
         }
+        $ids = array_unique($ids);
+        sort($ids);
+        $cursore = (int) get_option(self::OPTION_CURSORE, 0);
+        $restanti = array_values(array_filter($ids, function ($id) use ($cursore) {
+            return $id > $cursore;
+        }));
+        // Dopo l'ultimo, anche perché nel frattempo l'elenco si è accorciato: subito dal primo.
+        if (!$restanti) {
+            $restanti = $ids;
+        }
+        $giro = array_slice($restanti, 0, 250);
         $riprese = 0;
         $fallite = 0;
-        foreach ($trovati->orders as $id) {
+        foreach ($giro as $id) {
             // Il lock dell'invio, senza attesa: se un job sta lavorando sull'ordine, al giro dopo.
             $lock = 'rlb_ordine_' . $id;
             if (self::lock($lock, 0) !== '1') {
@@ -618,7 +627,7 @@ class Sender
                 self::unlock($lock);
             }
         }
-        update_option(self::OPTION_PAGINA, $pagina < $trovati->max_num_pages ? $pagina + 1 : 1, false);
+        update_option(self::OPTION_CURSORE, count($restanti) > count($giro) ? end($giro) : 0, false);
         update_option(self::OPTION_RICONCILIA, ['quando' => time(), 'riprese' => $riprese, 'fallite' => $fallite], false);
     }
 
@@ -637,14 +646,18 @@ class Sender
         return null;
     }
 
-    /** Ricerca di ordini per meta, con il totale (->orders, ->total), su HPOS e sull'archivio classico. */
-    private static function search(array $meta_query, int $limit, string $verso, int $pagina = 1)
+    /**
+     * Ordini con tutte le condizioni sulle meta, per id nel verso dato, con il totale (->orders,
+     * ->total), su HPOS e sull'archivio classico; $limit -1 per tutti. Solo AND: WooCommerce e
+     * WordPress uniscono le meta di "=" ed EXISTS solo per ordine, e un OR fra due di queste unioni
+     * moltiplica le meta di ogni ordine fra loro. Su un archivio grande la query non finisce.
+     */
+    private static function search(array $condizioni, int $limit, string $verso)
     {
         $args = [
             'type'     => 'shop_order',
             'limit'    => $limit,
-            'page'     => $pagina,
-            'orderby'  => 'date',
+            'orderby'  => 'ID',
             'order'    => $verso,
             'return'   => 'ids',
             'paginate' => true,
@@ -652,7 +665,7 @@ class Sender
         // HPOS accetta meta_query; l'archivio classico (post) la ignora e restituirebbe tutti gli
         // ordini: lì la aggiunge cpt_query() da una variabile nostra.
         $hpos = class_exists(OrderUtil::class) && OrderUtil::custom_orders_table_usage_is_enabled();
-        $args[$hpos ? 'meta_query' : 'rlb_stato'] = $meta_query;
+        $args[$hpos ? 'meta_query' : 'rlb_stato'] = ['relation' => 'AND'] + $condizioni;
         return wc_get_orders($args);
     }
 

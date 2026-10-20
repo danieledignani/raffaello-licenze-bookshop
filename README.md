@@ -76,9 +76,10 @@ sullo snippet GreenBubble.
    fermato prima di programmare l'invio, job interrotto da un errore fatale o da un timeout, lock del
    database non disponibile, azione annullata a mano. Li rimette in coda da sola e conta le riprese
    (`_rscu_riprese_<evento>`, azzerate da un invio arrivato a Scuola e da "Reinvia"); alla quarta
-   volta l'evento diventa `fallito` con motivo `interrotto` e compare in B6. Scorre gli ordini a
-   pagine di 250 (al massimo 500 coppie ordine/evento per giro): la pagina dopo al giro dopo, poi
-   ricomincia. Salta gli ordini con un invio in corso. L'esito dell'ultimo giro è in B15.
+   volta l'evento diventa `fallito` con motivo `interrotto` e compare in B6. Scorre gli ordini in
+   ordine di id, 250 per giro (al massimo 500 coppie ordine/evento): il giro dopo riparte
+   dall'ordine successivo all'ultimo visto e, finito l'elenco, dal primo. Salta gli ordini con un
+   invio in corso. L'esito dell'ultimo giro è in B15.
    Con le stesse regole riprende anche le fotografie senza stato dell'assegnazione e le revoche
    senza stato (marcatore e fotografia, nessuno stato della revoca) degli ordini creati da più di
    30 minuti: salvataggi interrotti a metà e ordini fotografati dal vecchio snippet.
@@ -103,7 +104,9 @@ per ora i prodotti RSCU si vendono singolarmente, vedi sotto), `senza_destinatar
   dello stesso ordine si mettono in fila con i lock del database (`GET_LOCK`, con il prefisso delle
   tabelle nel nome: `wp_rlb_ordine_123`, `wp_rlb_foto_123`), che non valgono fra server diversi.
 - Compatibile con l'archivio ordini HPOS di WooCommerce e con quello classico su post (usa solo le
-  API CRUD degli ordini).
+  API CRUD degli ordini). Le ricerche sulle meta degli ordini hanno solo condizioni in AND, una
+  ricerca per caso: con un OR fra meta diverse WooCommerce e WordPress moltiplicano fra loro le
+  meta di ogni ordine, e su un archivio grande la query non finisce.
 
 ## Installazione
 
@@ -476,7 +479,7 @@ Azioni:
   nelle note.
 - Il plugin, se lo si disattiva, toglie la riconciliazione da Action Scheduler e lascia le sue
   opzioni (`rlb_impostazioni`, `rlb_ping`, `rlb_ultimo_invio`, `rlb_greenbubble`,
-  `rlb_riconciliazione`, `rlb_riconciliazione_pagina`), il transient `rlb_bloccanti` e le meta
+  `rlb_riconciliazione`, `rlb_riconciliazione_cursore`), il transient `rlb_bloccanti` e le meta
   d'ordine.
 
 ## Rilascio
