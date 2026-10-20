@@ -1,18 +1,18 @@
 {
   "name": "Raffaello Licenze — Bookshop",
-  "version": "1.0.2",
-  "download_url": "https://github.com/danieledignani/raffaello-licenze-bookshop/releases/download/1.0.2/raffaello-licenze-bookshop.zip",
+  "version": "1.0.3",
+  "download_url": "https://github.com/danieledignani/raffaello-licenze-bookshop/releases/download/1.0.3/raffaello-licenze-bookshop.zip",
   "homepage": "https://raffaellolibri.it",
   "requires": "5.8",
   "tested": "6.5",
   "requires_php": "7.4",
-  "last_updated": "2026-10-20 01:24:31",
+  "last_updated": "2026-10-20 02:10:21",
   "upgrade_notice": "Aggiornamento automatico da GitHub",
   "author": "Gruppo Raffaello",
   "author_homepage": "https://github.com/danieledignani",
   "sections": {
     "description": "Manda a Raffaello Scuola le licenze RSCU vendute sul Bookshop con License Manager for WooCommerce, per attivarle sul profilo Raffaello Identity di chi compra.",
     "installation": "Carica il plugin tramite il pannello 'Plugin > Aggiungi nuovo' o scompatta nella cartella wp-content/plugins/",
-    "changelog": "<li>Fotografia sotto lock insieme allo stato, riconciliazione oraria degli invii, recupero da License Manager e avvisi più leggeri</li>\n<li>Update JSON to version 1.0.1</li>"
+    "changelog": "<li>Ricerche degli ordini solo in AND: la riconciliazione e i controlli B6 e B14 non finivano su un archivio grande</li>\n<li>Update JSON to version 1.0.2</li>"
   }
 }
