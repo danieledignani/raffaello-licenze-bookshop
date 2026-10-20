@@ -49,7 +49,10 @@ class Admin
         );
     }
 
-    /** Problemi bloccanti in Bacheca e nelle pagine WooCommerce; non in quella del plugin, che ha la checklist. */
+    /**
+     * Problemi bloccanti in Bacheca e nelle pagine WooCommerce; non in quella del plugin, che ha la
+     * checklist. Dal risultato tenuto 5 minuti: la checklist completa cerca ordini e snippet.
+     */
     public static function notices(): void
     {
         $screen = get_current_screen();
@@ -61,7 +64,7 @@ class Admin
         if ($screen->id !== 'dashboard' && !in_array($screen->id, $woocommerce, true)) {
             return;
         }
-        $bloccanti = Checks::blocking();
+        $bloccanti = Checks::blocking_cached();
         if (!$bloccanti) {
             return;
         }
@@ -79,11 +82,13 @@ class Admin
     public static function action_save(): void
     {
         self::guard('rlb_salva');
-        self::back(Config::save(
+        $esito = Config::save(
             wp_unslash((string) ($_POST['url'] ?? '')),
             wp_unslash((string) ($_POST['secret'] ?? '')),
             !empty($_POST['cancella_segreto'])
-        ));
+        );
+        Checks::invalidate();
+        self::back($esito);
     }
 
     public static function action_ping(): void
@@ -92,13 +97,16 @@ class Admin
         if (Config::current()['ok']) {
             Ping::run();
         }
+        Checks::invalidate();
         self::back('ping');
     }
 
     public static function action_requeue(): void
     {
         self::guard('rlb_rimetti');
-        self::back('rimessi', ['rlb_n' => Plugin::active() ? Sender::requeue() : 0]);
+        $n = Plugin::active() ? Sender::requeue() : 0;
+        Checks::invalidate();
+        self::back('rimessi', ['rlb_n' => $n]);
     }
 
     public static function action_confirm(): void
@@ -134,7 +142,9 @@ class Admin
         echo '<div class="wrap"><h1>' . esc_html__('Raffaello Licenze — Bookshop', 'raffaello-licenze-bookshop') . '</h1>';
         echo '<p>' . esc_html__('Manda a Raffaello Scuola le licenze RSCU vendute qui, per attivarle sul profilo Raffaello Identity di chi compra. Istruzioni complete nel README del plugin.', 'raffaello-licenze-bookshop') . '</p>';
         self::message();
+        // Qui sempre da zero; l'avviso si ricalcola alla prossima pagina, così non contraddice la checklist.
         self::checklist(Checks::run());
+        Checks::invalidate();
         self::connection_form($config);
         self::ping_box($config);
         echo '</div>';
@@ -198,8 +208,8 @@ class Admin
                 esc_html($v['testo'])
             );
             self::order_links($v);
-            if (in_array($v['id'], ['B6', 'B15'], true) && $v['ordini']) {
-                self::button('rlb_rimetti', __('Rimetti in coda gli invii falliti e interrotti', 'raffaello-licenze-bookshop'));
+            if ($v['id'] === 'B6' && $v['ordini']) {
+                self::button('rlb_rimetti', __('Rimetti in coda gli invii falliti', 'raffaello-licenze-bookshop'));
             }
             if (isset($v['conferma'])) {
                 self::button('rlb_conferma', __('Ho verificato l\'esclusione delle RSCU nello snippet GreenBubble', 'raffaello-licenze-bookshop'), ['hash' => $v['conferma']]);

@@ -7,10 +7,10 @@ if (!defined('ABSPATH')) {
 }
 
 /**
- * Checklist di configurazione (controlli B1-B14 del go-live, B15 sugli invii interrotti, dipendenze e
+ * Checklist di configurazione (controlli B1-B14 del go-live, B15 sulla riconciliazione, dipendenze e
  * vecchio snippet). La stessa lista alimenta la pagina Impostazioni, l'avviso
- * in admin (solo i bloccanti) e Salute del sito. Nessuna chiamata HTTP: il
- * collegamento si legge dall'ultima prova o dall'ultimo invio.
+ * in admin (solo i bloccanti, ricalcolati al massimo ogni 5 minuti) e Salute del sito.
+ * Nessuna chiamata HTTP: il collegamento si legge dall'ultima prova o dall'ultimo invio.
  *
  * Ogni voce: id, titolo, esito (ok, ko, non_verificabile), gravita (bloccante,
  * attenzione, informativo), testo, ordini (id degli ordini da guardare).
@@ -18,11 +18,16 @@ if (!defined('ABSPATH')) {
  */
 class Checks
 {
+    /** Bloccanti per l'avviso in admin. */
+    const CACHE = 'rlb_bloccanti';
+
     /** Tutte le voci, nell'ordine della checklist. */
     public static function run(): array
     {
         $config = Config::current();
-        $voci = [self::dipendenze(), self::snippet(), self::url($config), self::segreto($config)];
+        // Gli snippet si leggono una volta sola: servono a D2 e a B13.
+        $snippets = GreenBubble::snippets();
+        $voci = [self::dipendenze(), self::snippet($snippets), self::url($config), self::segreto($config)];
         if (!Plugin::dependencies_ok()) {
             return $voci;
         }
@@ -34,14 +39,14 @@ class Checks
             self::http_esterno($config),
             self::coda(),
             self::falliti(),
-            self::interrotti(),
+            self::riconciliazione(),
             self::license_manager(),
             self::consegna(),
             self::generatore($generatori),
             self::prodotti($generatori),
             self::sku($ping),
             self::identity(),
-            GreenBubble::check(),
+            GreenBubble::check($snippets),
             self::da_sistemare()
         );
         return $voci;
@@ -60,6 +65,23 @@ class Checks
         return array_values(array_filter(self::problems(), function ($v) {
             return $v['gravita'] === 'bloccante';
         }));
+    }
+
+    /** I bloccanti dell'avviso in admin, ricalcolati al massimo ogni 5 minuti. */
+    public static function blocking_cached(): array
+    {
+        $bloccanti = get_transient(self::CACHE);
+        if (!is_array($bloccanti)) {
+            $bloccanti = self::blocking();
+            set_transient(self::CACHE, $bloccanti, 5 * MINUTE_IN_SECONDS);
+        }
+        return $bloccanti;
+    }
+
+    /** Dopo un'azione che cambia la checklist: l'avviso si ricalcola alla pagina dopo. */
+    public static function invalidate(): void
+    {
+        delete_transient(self::CACHE);
     }
 
     public static function ok(string $id, string $titolo, string $testo): array
@@ -99,10 +121,10 @@ class Checks
     }
 
     /** Il vecchio snippet, caricato in questa richiesta o attivo in Code Snippets. */
-    private static function snippet(): array
+    private static function snippet(?array $snippets): array
     {
         $titolo = __('Vecchio snippet "Raffaello Scuola: licenze RSCU"', 'raffaello-licenze-bookshop');
-        $attivi = array_filter(GreenBubble::snippets() ?? [], function ($s) {
+        $attivi = array_filter($snippets ?? [], function ($s) {
             return $s['active'] && strpos($s['code'], 'rscu_licenze_assegnate') !== false;
         });
         if (!Plugin::snippet_loaded() && !$attivi) {
@@ -225,24 +247,30 @@ class Checks
         }
         return self::ko('B6', $titolo, 'bloccante', sprintf(
             /* translators: %d: numero di ordini */
-            _n('%d ordine con invio fallito definitivamente: correggi la causa (nota d\'ordine) e usa "Rimetti in coda gli invii falliti e interrotti".', '%d ordini con invio fallito definitivamente: correggi la causa (note d\'ordine) e usa "Rimetti in coda gli invii falliti e interrotti".', $falliti->total, 'raffaello-licenze-bookshop'),
+            _n('%d ordine con invio fallito definitivamente: correggi la causa (nota d\'ordine) e usa "Rimetti in coda gli invii falliti".', '%d ordini con invio fallito definitivamente: correggi la causa (note d\'ordine) e usa "Rimetti in coda gli invii falliti".', $falliti->total, 'raffaello-licenze-bookshop'),
             $falliti->total
         ), $falliti->orders);
     }
 
-    /** B15: azioni di Action Scheduler fallite con l'ordine ancora in coda; in pagina i primi 50. */
-    private static function interrotti(): array
+    /** B15: l'ultimo giro della riconciliazione oraria, che riprende gli invii rimasti in coda senza job. */
+    private static function riconciliazione(): array
     {
-        $titolo = __('Invii interrotti', 'raffaello-licenze-bookshop');
-        $ordini = Sender::stuck();
-        if (!$ordini) {
-            return self::ok('B15', $titolo, __('Nessuno.', 'raffaello-licenze-bookshop'));
+        $titolo = __('Riconciliazione', 'raffaello-licenze-bookshop');
+        $giro = get_option(Sender::OPTION_RICONCILIA);
+        if (!is_array($giro)) {
+            return self::nv('B15', $titolo, 'attenzione', __('Non ha ancora girato. La programma il plugin alla prima pagina di amministrazione e la esegue Action Scheduler (azione rlb_riconcilia, gruppo raffaello-scuola): se resta così, guarda WooCommerce > Stato > Azioni programmate.', 'raffaello-licenze-bookshop'));
         }
-        return self::ko('B15', $titolo, 'bloccante', sprintf(
-            /* translators: %d: numero di ordini */
-            _n('%d ordine con un invio interrotto: l\'azione di Action Scheduler è fallita (per esempio per un errore fatale, un timeout o il lock del database) e l\'ordine è ancora in coda. Usa "Rimetti in coda gli invii falliti e interrotti".', '%d ordini con un invio interrotto: l\'azione di Action Scheduler è fallita (per esempio per un errore fatale, un timeout o il lock del database) e l\'ordine è ancora in coda. Usa "Rimetti in coda gli invii falliti e interrotti".', count($ordini), 'raffaello-licenze-bookshop'),
-            count($ordini)
-        ), array_slice($ordini, 0, 50));
+        $testo = sprintf(
+            /* translators: 1: data, 2: invii ripresi, 3: invii segnati falliti */
+            __('Ultimo giro il %1$s. Invii ripresi: %2$d; segnati falliti dopo 3 riprese: %3$d.', 'raffaello-licenze-bookshop'),
+            self::date($giro['quando']),
+            $giro['riprese'],
+            $giro['fallite']
+        );
+        if ($giro['quando'] < time() - 2 * HOUR_IN_SECONDS) {
+            return self::ko('B15', $titolo, 'attenzione', $testo . ' ' . __('Da più di 2 ore non gira: Action Scheduler è fermo (WP-Cron?) o l\'azione rlb_riconcilia non è programmata. Guarda WooCommerce > Stato > Azioni programmate, gruppo raffaello-scuola.', 'raffaello-licenze-bookshop'));
+        }
+        return self::ok('B15', $titolo, $testo);
     }
 
     private static function license_manager(): array
@@ -355,8 +383,8 @@ class Checks
             if ($p->get_sku() === '') {
                 $difetti[] = __('senza SKU', 'raffaello-licenze-bookshop');
             }
-            if ($p->get_sold_individually()) {
-                $difetti[] = __('venduto singolarmente', 'raffaello-licenze-bookshop');
+            if (!$p->get_sold_individually()) {
+                $difetti[] = __('si può comprare in più copie: per ora i codici regalo non servono, metti «Venduto singolarmente»', 'raffaello-licenze-bookshop');
             }
             if (absint($p->get_meta('lmfwc_licensed_product_delivered_quantity')) > 1) {
                 $difetti[] = __('quantità consegnata maggiore di 1', 'raffaello-licenze-bookshop');
@@ -369,7 +397,7 @@ class Checks
         $testo = sprintf(_n('%d prodotto collegato al generatore.', '%d prodotti collegati al generatore.', count($prodotti), 'raffaello-licenze-bookshop'), count($prodotti));
         return $problemi
             ? self::ko('B10', $titolo, 'attenzione', $testo . ' ' . implode('; ', $problemi) . '.')
-            : self::ok('B10', $titolo, $testo . ' ' . __('Virtuali, con SKU, vendibili in più copie, una chiave per copia.', 'raffaello-licenze-bookshop'));
+            : self::ok('B10', $titolo, $testo . ' ' . __('Virtuali, con SKU, venduti singolarmente, una chiave per acquisto.', 'raffaello-licenze-bookshop'));
     }
 
     private static function sku(?array $ping): array

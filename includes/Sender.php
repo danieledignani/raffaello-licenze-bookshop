@@ -25,6 +25,10 @@ if (!defined('ABSPATH')) {
  *   così assegnazione e revoca dello stesso ordine non si sovrascrivono anche con
  *   più batch di Action Scheduler insieme. Stati: in_coda, inviato, attivato,
  *   da_sistemare, fallito.
+ * - Fotografia e marcatore di revoca si scrivono sotto un lock breve per ordine, nello
+ *   stesso salvataggio dello stato "in coda" (prima la fotografia, poi lo stato); sotto lo
+ *   stesso lock il job chiude l'invio. Un'interruzione prima di programmare l'invio, o a metà
+ *   del salvataggio, la ripara la riconciliazione oraria.
  *
  * Fotografia (_rscu_licenze, _rscu_cliente), _rscu_revocato, azione e gruppo di
  * Action Scheduler sono quelli dello snippet che il plugin sostituisce.
@@ -39,8 +43,19 @@ class Sender
     // Prefissi: la chiave è il prefisso seguito dall'evento (licenze_assegnate, licenze_revocate).
     const META_ESITO = '_rscu_esito_';
     const META_STATO = '_rscu_stato_';
+    const META_RIPRESE = '_rscu_riprese_';
+    const EVENTI = ['licenze_assegnate', 'licenze_revocate'];
     const AZIONE = 'rscu_invia_licenze';
     const GRUPPO = 'raffaello-scuola';
+
+    // Riconciliazione: ogni ora riprende gli invii rimasti in coda senza job (al massimo 3 volte).
+    const RICONCILIA = 'rlb_riconcilia';
+    const OPTION_RICONCILIA = 'rlb_riconciliazione';
+    const OPTION_PAGINA = 'rlb_riconciliazione_pagina';
+    const MAX_RIPRESE = 3;
+
+    /** Repository delle licenze di License Manager 3.0.20 (findAllBy, come prima del suo hook). */
+    const LM_LICENZE = \LicenseManagerForWooCommerce\Repositories\Resources\License::class;
 
     /** Ultimo invio vero: codice, testo, ora, ordine e impronta della configurazione. */
     const OPTION_ULTIMO = 'rlb_ultimo_invio';
@@ -63,9 +78,12 @@ class Sender
         add_action(self::AZIONE, [self::class, 'invia'], 10, 2);
         add_filter('woocommerce_order_actions', [self::class, 'azioni_ordine'], 10, 2);
         add_action('woocommerce_order_action_rscu_reinvia', [self::class, 'reinvia']);
+        add_action('woocommerce_order_action_rscu_recupera', [self::class, 'recupera']);
         add_action('woocommerce_order_status_refunded', [self::class, 'ordine_revocato'], 10, 2);
         add_action('woocommerce_order_status_cancelled', [self::class, 'ordine_revocato'], 10, 2);
         add_action('woocommerce_order_partially_refunded', [self::class, 'rimborso_parziale'], 10, 2);
+        add_action(self::RICONCILIA, [self::class, 'riconcilia']);
+        add_action('admin_init', [self::class, 'programma_riconciliazione']);
     }
 
     /**
@@ -76,40 +94,99 @@ class Sender
     public static function licenze_assegnate($args): void
     {
         $order = wc_get_order($args['orderId'] ?? 0);
-        if (!$order) {
+        $rscu = array_filter((array) ($args['licenses'] ?? []), function ($license) {
+            return strpos((string) $license->getDecryptedLicenseKey(), self::PREFISSO) === 0;
+        });
+        if (!$order || !$rscu) {
             return;
         }
 
-        $salvate = $order->get_meta(self::META_LICENZE);
-        $salvate = is_array($salvate) ? $salvate : [];
-        $nuove = 0;
-        foreach ((array) ($args['licenses'] ?? []) as $license) {
-            $chiave = (string) $license->getDecryptedLicenseKey();
-            $id = (int) $license->getId();
-            if (strpos($chiave, self::PREFISSO) !== 0 || isset($salvate[$id])) {
-                continue;
+        // Lock breve, non quello dell'invio, che resta preso durante le chiamate a Scuola.
+        $lock = 'rlb_foto_' . $order->get_id();
+        $preso = self::lock($lock, 10) === '1';
+        if (!$preso) {
+            // Meglio una fotografia senza lock che nessuna fotografia.
+            Log::write('warning', sprintf('Ordine %d: lock della fotografia non ottenuto in 10 secondi, si fotografa lo stesso.', $order->get_id()));
+        }
+        try {
+            $order->read_meta_data(true);
+            $salvate = $order->get_meta(self::META_LICENZE);
+            $salvate = is_array($salvate) ? $salvate : [];
+            $nuove = 0;
+            foreach ($rscu as $license) {
+                $id = (int) $license->getId();
+                if (!isset($salvate[$id])) {
+                    $salvate[$id] = self::fotografa($order, $license, (string) $license->getDecryptedLicenseKey());
+                    $nuove++;
+                }
             }
-            $salvate[$id] = self::fotografa($order, $license, $chiave);
-            $nuove++;
-        }
-        if (!$nuove) {
-            return;
-        }
+            if (!$nuove) {
+                return;
+            }
 
-        // Il destinatario si fotografa una volta sola, al primo invio dell'ordine.
-        if (!$order->get_meta(self::META_CLIENTE)) {
-            $sub = $order->get_customer_id() ? (string) get_user_meta($order->get_customer_id(), 'ri_oidc_sub', true) : '';
-            $order->update_meta_data(self::META_CLIENTE, ['sub' => $sub !== '' ? $sub : null, 'email' => $order->get_billing_email()]);
+            // WooCommerce scrive una meta per query, senza transazione: le chiavi nuove nell'ordine delle
+            // update_meta_data, quelle esistenti nell'ordine di lettura. Prima cliente e fotografia,
+            // poi tentativi, esito e stato: un'interruzione a metà lascia una fotografia senza stato,
+            // che la riconciliazione riprende, mai uno stato senza fotografia.
+            // Il destinatario si fotografa una volta sola, al primo invio dell'ordine.
+            if (!$order->get_meta(self::META_CLIENTE)) {
+                $sub = $order->get_customer_id() ? (string) get_user_meta($order->get_customer_id(), 'ri_oidc_sub', true) : '';
+                $order->update_meta_data(self::META_CLIENTE, ['sub' => $sub !== '' ? $sub : null, 'email' => $order->get_billing_email()]);
+            }
+            ksort($salvate);
+            $order->update_meta_data(self::META_LICENZE, $salvate);
+            // Nello stesso salvataggio lo stato "da inviare": se il processo si ferma prima di
+            // programmare l'invio, la riconciliazione lo trova in coda senza job.
+            $revocato = (bool) $order->get_meta(self::META_REVOCATO);
+            self::da_inviare($order, 'licenze_assegnate');
+            if ($revocato) {
+                // Ordine revocato prima che License Manager assegnasse queste licenze: si revocano anche loro.
+                self::da_inviare($order, 'licenze_revocate');
+            }
+            self::salva_fotografia($order);
+        } finally {
+            if ($preso) {
+                self::unlock($lock);
+            }
         }
-        ksort($salvate);
-        $order->update_meta_data(self::META_LICENZE, $salvate);
-        $order->save();
 
         self::accoda($order, 'licenze_assegnate', false);
-        // Ordine revocato prima che License Manager assegnasse queste licenze: si revocano anche loro.
-        if ($order->get_meta(self::META_REVOCATO)) {
+        if ($revocato) {
             self::accoda($order, 'licenze_revocate', false);
         }
+    }
+
+    /** Stato "in coda" con i tentativi azzerati, da salvare insieme a fotografia o revoca. */
+    private static function da_inviare(\WC_Order $order, string $evento): void
+    {
+        $order->update_meta_data(self::META_TENTATIVI . $evento, 0);
+        self::segna($order, $evento, 'in_coda', [], 'in coda per l\'invio');
+    }
+
+    /** Il salvataggio con la fotografia: un errore SQL scriverebbe nel log la query con le chiavi complete. */
+    private static function salva_fotografia(\WC_Order $order): void
+    {
+        global $wpdb;
+        $prev = $wpdb->suppress_errors(true);
+        try {
+            $order->save();
+        } finally {
+            $wpdb->suppress_errors($prev);
+        }
+    }
+
+    /** GET_LOCK con il prefisso delle tabelle nel nome (più siti sullo stesso server): '1', '0' o null. */
+    private static function lock(string $nome, int $attesa)
+    {
+        global $wpdb;
+        $preso = $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, %d)', $wpdb->prefix . $nome, $attesa));
+        return $preso === null ? null : (string) $preso;
+    }
+
+    private static function unlock(string $nome): void
+    {
+        global $wpdb;
+        $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $wpdb->prefix . $nome));
     }
 
     /** Dati di una licenza come li riceve Raffaello Scuola, calcolati una volta sola. */
@@ -161,8 +238,7 @@ class Sender
         } elseif (as_get_scheduled_actions(['hook' => self::AZIONE, 'args' => $args, 'group' => self::GRUPPO, 'status' => 'pending', 'per_page' => 1], 'ids')) {
             return;
         }
-        $order->update_meta_data(self::META_TENTATIVI . $evento, 0);
-        self::segna($order, $evento, 'in_coda', [], 'in coda per l\'invio');
+        self::da_inviare($order, $evento);
         $order->save();
         self::programma($order, $evento, self::ATTESE[0]);
     }
@@ -186,17 +262,16 @@ class Sender
      */
     public static function invia($order_id, $evento): void
     {
-        global $wpdb;
         $order_id = (int) $order_id;
         $lock = 'rlb_ordine_' . $order_id;
-        $preso = $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, 0)', $lock));
+        $preso = self::lock($lock, 0);
         // Senza lock non si scrive niente sull'ordine: un errore fa fallire l'azione di Action
-        // Scheduler, e l'ordine resta in coda senza job, cioè fra gli "invii interrotti" della checklist (B15).
+        // Scheduler, l'ordine resta in coda senza job e lo riprende la riconciliazione.
         if ($preso === null) {
             Log::write('error', sprintf('Ordine %d, %s: lock del database non disponibile, invio non eseguito.', $order_id, $evento));
             throw new \RuntimeException(sprintf('Invio dell\'ordine %d non eseguito: lock del database non disponibile.', $order_id));
         }
-        if ((string) $preso !== '1') {
+        if ($preso !== '1') {
             // Ordine già in invio: si riprova fra un minuto, senza consumare tentativi e senza nota.
             if (!as_schedule_single_action(time() + 60, self::AZIONE, [$order_id, $evento], self::GRUPPO)) {
                 Log::write('error', sprintf('Ordine %d, %s: ordine già in invio e nuovo tentativo non programmato.', $order_id, $evento));
@@ -207,7 +282,7 @@ class Sender
         try {
             self::invia_ordine($order_id, $evento);
         } finally {
-            $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock));
+            self::unlock($lock);
         }
     }
 
@@ -281,7 +356,7 @@ class Sender
             }
             self::segna($order, $evento, 'fallito', [$risposta['codice']], sprintf('tentativo %d: %s', $tentativo, $motivo));
             $order->save();
-            $order->add_order_note(sprintf('Raffaello Scuola, %s fallita definitivamente al tentativo %d (%s). Usa l\'azione "Reinvia licenze a Raffaello Scuola" o "Rimetti in coda gli invii falliti e interrotti" in WooCommerce > Raffaello Scuola.', $azione, $tentativo, $motivo));
+            $order->add_order_note(sprintf('Raffaello Scuola, %s fallita definitivamente al tentativo %d (%s). Usa l\'azione "Reinvia licenze a Raffaello Scuola" o "Rimetti in coda gli invii falliti" in WooCommerce > Raffaello Scuola.', $azione, $tentativo, $motivo));
             return;
         }
         self::ricorda($config, 'ok', 'HTTP 200', $order->get_id());
@@ -318,8 +393,32 @@ class Sender
         foreach ($motivi as $motivo) {
             $nota .= ' ' . self::come_sistemare($motivo);
         }
-        self::segna($order, $evento, $stato, $motivi, implode('; ', $righe));
-        $order->save();
+
+        // Chiusura sotto il lock della fotografia: rilettura, confronto con le licenze mandate ed
+        // esito finale non si incrociano con una fotografia nuova. Senza lock non si chiude: lo
+        // stato resta "in coda" e si rimanda tutto, l'endpoint è idempotente.
+        $lock = 'rlb_foto_' . $order->get_id();
+        if (self::lock($lock, 10) !== '1') {
+            Log::write('warning', sprintf('Ordine %d, %s: lock della fotografia non ottenuto in 10 secondi, invio riuscito ma da ripetere.', $order->get_id(), $azione));
+            self::accoda($order, $evento, false);
+            return;
+        }
+        try {
+            $order->read_meta_data(true);
+            $fotografia = $order->get_meta(self::META_LICENZE);
+            // Licenze fotografate durante l'invio: lo stato resta "in coda" e si rimanda tutto.
+            if (array_diff_key(is_array($fotografia) ? $fotografia : [], $licenze)) {
+                Log::write('info', sprintf('Ordine %d, %s: licenze nuove arrivate durante l\'invio, si rimanda tutto.', $order->get_id(), $azione));
+                self::accoda($order, $evento, false);
+                return;
+            }
+            self::segna($order, $evento, $stato, $motivi, implode('; ', $righe));
+            // Le riprese contano le interruzioni di fila: un invio arrivato a Scuola le azzera.
+            $order->delete_meta_data(self::META_RIPRESE . $evento);
+            $order->save();
+        } finally {
+            self::unlock($lock);
+        }
         $order->add_order_note($nota);
         Log::write($motivi ? 'warning' : 'info', sprintf('Ordine %d, tentativo %d. %s', $order->get_id(), $tentativo, $nota));
     }
@@ -437,33 +536,114 @@ class Sender
         return self::search($meta_query, 50, 'DESC');
     }
 
-    /**
-     * Ordini con un invio interrotto: un'azione di Action Scheduler fallita (errore fatale,
-     * timeout segnato da Action Scheduler, lock del database) con l'evento ancora in coda e
-     * nessuna azione in attesa o in esecuzione per la stessa coppia ordine ed evento.
-     * Le azioni fallite di solito sono zero; Action Scheduler le tiene 3 mesi.
-     */
-    public static function stuck(): array
+    /** Programma la riconciliazione oraria, se manca (anche dopo che qualcuno l'ha cancellata). */
+    public static function programma_riconciliazione(): void
     {
-        $interrotti = [];
-        foreach (as_get_scheduled_actions(['hook' => self::AZIONE, 'group' => self::GRUPPO, 'status' => 'failed', 'per_page' => -1]) as $azione) {
-            $args = $azione->get_args();
-            $order = wc_get_order($args[0]);
-            if ($order && (self::esito($order, $args[1])['stato'] ?? '') === 'in_coda'
-                && !as_get_scheduled_actions(['hook' => self::AZIONE, 'args' => $args, 'group' => self::GRUPPO, 'status' => ['pending', 'in-progress'], 'per_page' => 1], 'ids')) {
-                $interrotti[] = (int) $args[0];
+        if (as_next_scheduled_action(self::RICONCILIA, [], self::GRUPPO) === false) {
+            as_schedule_recurring_action(time(), HOUR_IN_SECONDS, self::RICONCILIA, [], self::GRUPPO);
+        }
+    }
+
+    /**
+     * Job orario di Action Scheduler: riprende gli eventi in coda da più di 30 minuti senza
+     * un'azione in attesa o in esecuzione (processo fermato prima di programmare l'invio, job
+     * interrotto da un errore fatale o un timeout, lock del database), e le fotografie o le
+     * revoche rimaste senza stato in un ordine di più di 30 minuti (salvataggio interrotto a
+     * metà, ordini dello snippet). Dopo 3 riprese l'evento risulta fallito (motivo "interrotto").
+     * A pagine di 250 ordini, cioè al massimo 500 coppie per giro: la pagina dopo al giro dopo,
+     * poi si ricomincia.
+     */
+    public static function riconcilia(): void
+    {
+        $pagina = max(1, (int) get_option(self::OPTION_PAGINA, 1));
+        $da_riprendere = [
+            'relation' => 'OR',
+            ['key' => self::META_STATO . 'licenze_assegnate', 'value' => 'in_coda'],
+            ['key' => self::META_STATO . 'licenze_revocate', 'value' => 'in_coda'],
+            [
+                'relation' => 'AND',
+                ['key' => self::META_LICENZE, 'compare' => 'EXISTS'],
+                ['key' => self::META_STATO . 'licenze_assegnate', 'compare' => 'NOT EXISTS'],
+            ],
+            [
+                'relation' => 'AND',
+                ['key' => self::META_REVOCATO, 'compare' => 'EXISTS'],
+                ['key' => self::META_LICENZE, 'compare' => 'EXISTS'],
+                ['key' => self::META_STATO . 'licenze_revocate', 'compare' => 'NOT EXISTS'],
+            ],
+        ];
+        $trovati = self::search($da_riprendere, 250, 'ASC', $pagina);
+        // Pagina vuota perché nel frattempo gli ordini da riprendere sono diminuiti: subito dalla prima.
+        if ($pagina > 1 && !$trovati->orders && $trovati->total) {
+            $pagina = 1;
+            $trovati = self::search($da_riprendere, 250, 'ASC', $pagina);
+        }
+        $riprese = 0;
+        $fallite = 0;
+        foreach ($trovati->orders as $id) {
+            // Il lock dell'invio, senza attesa: se un job sta lavorando sull'ordine, al giro dopo.
+            $lock = 'rlb_ordine_' . $id;
+            if (self::lock($lock, 0) !== '1') {
+                continue;
+            }
+            try {
+                $order = wc_get_order($id);
+                // Eliminato fra la ricerca e qui.
+                if (!$order) {
+                    continue;
+                }
+                $order->read_meta_data(true);
+                foreach (self::EVENTI as $evento) {
+                    $da = self::in_attesa_da($order, $evento);
+                    if ($da === null || $da > time() - 30 * MINUTE_IN_SECONDS
+                        || as_get_scheduled_actions(['hook' => self::AZIONE, 'args' => [$id, $evento], 'group' => self::GRUPPO, 'status' => ['pending', 'in-progress'], 'per_page' => 1], 'ids')) {
+                        continue;
+                    }
+                    $volte = (int) $order->get_meta(self::META_RIPRESE . $evento);
+                    if ($volte >= self::MAX_RIPRESE) {
+                        self::segna($order, $evento, 'fallito', ['interrotto'], sprintf('invio interrotto %d volte', $volte + 1));
+                        $order->save();
+                        $order->add_order_note(sprintf('Raffaello Scuola: invio (%s) interrotto più di %d volte, per esempio da un errore fatale, un timeout o il lock del database. Corretta la causa, usa "Reinvia licenze a Raffaello Scuola" o "Rimetti in coda gli invii falliti" in WooCommerce > Raffaello Scuola.', $evento, self::MAX_RIPRESE));
+                        Log::write('error', sprintf('Ordine %d, %s: invio interrotto più di %d volte, segnato fallito.', $id, $evento, self::MAX_RIPRESE));
+                        $fallite++;
+                        continue;
+                    }
+                    $order->update_meta_data(self::META_RIPRESE . $evento, $volte + 1);
+                    $order->save();
+                    self::accoda($order, $evento, false);
+                    Log::write('warning', sprintf('Ordine %d, %s: invio rimasto senza job, ripreso (%d di %d).', $id, $evento, $volte + 1, self::MAX_RIPRESE));
+                    $riprese++;
+                }
+            } finally {
+                self::unlock($lock);
             }
         }
-        // Più azioni fallite per la stessa coppia, o i due eventi dello stesso ordine: un ordine solo.
-        return array_values(array_unique($interrotti));
+        update_option(self::OPTION_PAGINA, $pagina < $trovati->max_num_pages ? $pagina + 1 : 1, false);
+        update_option(self::OPTION_RICONCILIA, ['quando' => time(), 'riprese' => $riprese, 'fallite' => $fallite], false);
+    }
+
+    /** Da quando l'evento aspetta un invio: in coda dall'esito, senza stato dalla creazione dell'ordine; null se non aspetta. */
+    private static function in_attesa_da(\WC_Order $order, string $evento): ?int
+    {
+        $stato = (string) $order->get_meta(self::META_STATO . $evento);
+        if ($stato === 'in_coda') {
+            return (int) (self::esito($order, $evento)['quando'] ?? 0);
+        }
+        if ($stato === '' && $order->get_meta(self::META_LICENZE) && ($evento === 'licenze_assegnate' || $order->get_meta(self::META_REVOCATO))) {
+            // Senza data di creazione vale come vecchio.
+            $creato = $order->get_date_created();
+            return $creato ? $creato->getTimestamp() : 0;
+        }
+        return null;
     }
 
     /** Ricerca di ordini per meta, con il totale (->orders, ->total), su HPOS e sull'archivio classico. */
-    private static function search(array $meta_query, int $limit, string $verso)
+    private static function search(array $meta_query, int $limit, string $verso, int $pagina = 1)
     {
         $args = [
             'type'     => 'shop_order',
             'limit'    => $limit,
+            'page'     => $pagina,
             'orderby'  => 'date',
             'order'    => $verso,
             'return'   => 'ids',
@@ -485,10 +665,10 @@ class Sender
         return $wp_query_args;
     }
 
-    /** Rimette in coda gli ultimi 50 ordini falliti e tutti quelli con un invio interrotto; restituisce quanti. */
+    /** Rimette in coda gli ultimi 50 ordini falliti; restituisce quanti. */
     public static function requeue(): int
     {
-        $ids = array_unique(array_merge(self::orders('fallito')->orders, self::stuck()));
+        $ids = self::orders('fallito')->orders;
         foreach ($ids as $id) {
             $order = wc_get_order($id);
             if ($order) {
@@ -498,23 +678,63 @@ class Sender
         return count($ids);
     }
 
-    /** Azione d'ordine nel menu "Azioni ordine" degli ordini con licenze RSCU. */
+    /**
+     * Azioni d'ordine nel menu "Azioni ordine": "Reinvia" per gli ordini con licenze RSCU,
+     * "Recupera" anche per quelli con prodotti che vendono licenze, se License Manager c'è.
+     */
     public static function azioni_ordine($actions, $order = null)
     {
-        if ($order instanceof \WC_Order && $order->get_meta(self::META_LICENZE)) {
+        if (!$order instanceof \WC_Order) {
+            return $actions;
+        }
+        $fotografia = (bool) $order->get_meta(self::META_LICENZE);
+        if ($fotografia) {
             $actions['rscu_reinvia'] = 'Reinvia licenze a Raffaello Scuola';
+        }
+        if (class_exists(self::LM_LICENZE) && ($fotografia || self::ha_licenze($order))) {
+            $actions['rscu_recupera'] = 'Recupera le licenze RSCU da License Manager';
         }
         return $actions;
     }
 
-    /** Rimette in coda gli stessi dati fotografati, e la revoca se l'ordine è stato revocato. */
+    /**
+     * Azione dell'assistenza: rilegge da License Manager le licenze dell'ordine (la stessa ricerca
+     * che fa prima del suo hook), fotografa le RSCU che mancano e rimette in coda l'invio di tutte.
+     * Per il processo fermato fra la consegna di License Manager e la fotografia (il suo hook non
+     * ripassa) e per le vendite fatte prima del plugin. Non lancia l'hook di License Manager:
+     * GreenBubble manderebbe le chiavi a Raffaello Digitale.
+     */
+    public static function recupera($order): void
+    {
+        $fotografia = $order->get_meta(self::META_LICENZE);
+        $prima = is_array($fotografia) ? count($fotografia) : 0;
+        $repository = self::LM_LICENZE;
+        $licenze = $repository::instance()->findAllBy(['order_id' => $order->get_id()]);
+        self::licenze_assegnate(['orderId' => $order->get_id(), 'licenses' => $licenze ?: []]);
+        $order->read_meta_data(true);
+        if (!$order->get_meta(self::META_LICENZE)) {
+            $order->add_order_note('Raffaello Scuola: License Manager non ha licenze RSCU per questo ordine, niente da mandare.');
+            return;
+        }
+        $nuove = count($order->get_meta(self::META_LICENZE)) - $prima;
+        $order->add_order_note($nuove
+            ? sprintf('Raffaello Scuola: %d %s da License Manager.', $nuove, $nuove === 1 ? 'licenza RSCU recuperata' : 'licenze RSCU recuperate')
+            : 'Raffaello Scuola: nessuna licenza RSCU nuova in License Manager, tutte già fotografate.');
+        self::reinvia($order);
+    }
+
+    /** Rimette in coda gli stessi dati fotografati, e la revoca se l'ordine è stato revocato; azzera le riprese. */
     public static function reinvia($order): void
     {
+        foreach (self::EVENTI as $evento) {
+            $order->update_meta_data(self::META_RIPRESE . $evento, 0);
+        }
         self::accoda($order, 'licenze_assegnate', true);
         if ($order->get_meta(self::META_REVOCATO)) {
             self::accoda($order, 'licenze_revocate', true);
         }
         $order->add_order_note('Raffaello Scuola: licenze rimesse in coda per l\'invio.');
+        Checks::invalidate();
     }
 
     /**
@@ -525,16 +745,33 @@ class Sender
     public static function ordine_revocato($order_id, $order = null): void
     {
         $order = $order instanceof \WC_Order ? $order : wc_get_order($order_id);
-        // Con la fotografia basta quella: il prodotto può essere stato eliminato o cambiato dopo la vendita.
-        if (!$order || (!$order->get_meta(self::META_LICENZE) && !self::ha_licenze($order))) {
+        if (!$order) {
             return;
         }
-        $order->update_meta_data(self::META_REVOCATO, time());
-        $order->save();
-        // Scrivi e poi rileggi: una fotografia salvata da un'altra richiesta dopo il caricamento
-        // di questo ordine si vede qui; se è salvata dopo, il suo job vede il marcatore.
-        $order->read_meta_data(true);
-        if ($order->get_meta(self::META_LICENZE)) {
+        // Lo stesso lock della fotografia: marcatore, rilettura e decisione non si incrociano con lei.
+        $lock = 'rlb_foto_' . $order->get_id();
+        $preso = self::lock($lock, 10) === '1';
+        if (!$preso) {
+            Log::write('warning', sprintf('Ordine %d: lock della fotografia non ottenuto in 10 secondi, si registra la revoca lo stesso.', $order->get_id()));
+        }
+        try {
+            $order->read_meta_data(true);
+            $con_foto = (bool) $order->get_meta(self::META_LICENZE);
+            // Con la fotografia basta quella: il prodotto può essere stato eliminato o cambiato dopo la vendita.
+            if (!$con_foto && !self::ha_licenze($order)) {
+                return;
+            }
+            $order->update_meta_data(self::META_REVOCATO, time());
+            if ($con_foto) {
+                self::da_inviare($order, 'licenze_revocate');
+            }
+            $order->save();
+        } finally {
+            if ($preso) {
+                self::unlock($lock);
+            }
+        }
+        if ($con_foto) {
             self::accoda($order, 'licenze_revocate', false);
         }
     }

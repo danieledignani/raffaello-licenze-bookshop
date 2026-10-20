@@ -3,7 +3,7 @@
  * Plugin Name: Raffaello Licenze — Bookshop
  * Plugin URI: https://raffaellolibri.it
  * Description: Manda a Raffaello Scuola le licenze RSCU vendute sul Bookshop con License Manager for WooCommerce: attivazione sul profilo di Raffaello Identity, revoca a rimborso o annullamento, impostazioni del collegamento, prova di connessione e controlli di configurazione.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Author: Gruppo Raffaello
  * Text Domain: raffaello-licenze-bookshop
  * Domain Path: /languages
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('RLB_VERSION', '1.0.1');
+define('RLB_VERSION', '1.0.2');
 define('RLB_PLUGIN_FILE', __FILE__);
 define('RLB_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('RLB_PLUGIN_BASENAME', plugin_basename(__FILE__));
@@ -51,3 +51,11 @@ add_action('before_woocommerce_init', function () {
 
 // Dopo Code Snippets, che esegue gli snippet a plugins_loaded priorità 1.
 add_action('plugins_loaded', [\RaffaelloLicenzeBookshop\Plugin::class, 'boot']);
+
+// La riconciliazione oraria è solo del plugin: senza, Action Scheduler la segnerebbe fallita ogni ora.
+// Gli invii in coda restano, per lo snippet o per il plugin riattivato. WooCommerce può essere già spento.
+register_deactivation_hook(__FILE__, function () {
+    if (function_exists('as_unschedule_all_actions')) {
+        as_unschedule_all_actions(\RaffaelloLicenzeBookshop\Sender::RICONCILIA, [], \RaffaelloLicenzeBookshop\Sender::GRUPPO);
+    }
+});

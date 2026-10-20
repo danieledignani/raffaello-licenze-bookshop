@@ -38,7 +38,13 @@ sullo snippet GreenBubble.
    scadenza. Nella meta `_rscu_cliente` fotografa una volta sola il `sub` di Identity del cliente
    (user meta `ri_oidc_sub`, `null` se manca) e l'email di fatturazione. La scadenza è quella di
    License Manager; se manca, la data di pagamento più i giorni di validità; altrimenti `null`
-   (illimitata). La fotografia non cambia più, anche se poi cambiano prodotto o cliente.
+   (illimitata). La fotografia non cambia più, anche se poi cambiano prodotto o cliente. Si scrive
+   sotto un lock breve per ordine (`<prefisso>rlb_foto_<id>`), nello stesso salvataggio dello stato
+   `in_coda`: se il processo si ferma prima di programmare l'invio, l'ordine resta in coda e lo
+   riprende la riconciliazione (punto 8). Un salvataggio di WooCommerce non è una transazione (una
+   query per meta, le chiavi nuove nell'ordine in cui il plugin le imposta): il plugin scrive prima
+   cliente e fotografia, poi tentativi, esito e stato, così un'interruzione a metà lascia una
+   fotografia senza stato, che la riconciliazione riprende.
 3. Accoda con Action Scheduler (gruppo `raffaello-scuola`, azione `rscu_invia_licenze`) un invio per
    ordine ed evento, un minuto dopo. Il job manda il JSON a
    `URL di Scuola/wp-json/raffaello-licenze/v1/eventi`, a lotti di al massimo 50 licenze e 64 KB,
@@ -49,22 +55,38 @@ sullo snippet GreenBubble.
    di manutenzione o di cache con 200, un JSON senza tutti gli esiti): 5 tentativi in tutto, a
    1 min, 5 min, 30 min, 2 h e 6 h l'uno dall'altro (circa 8 h 36 min). Al go-live questi sono
    errori di configurazione: corretti, gli invii ripartono da soli. Definitivo resta il 400 (Scuola
-   rifiuta il contenuto).
+   rifiuta il contenuto). A invio riuscito il job chiude sotto il lock della fotografia: rilegge la
+   fotografia e, se ci sono licenze arrivate nel frattempo, lascia l'esito `in_coda` e rimanda tutto
+   (Scuola è idempotente); se il lock non arriva in 10 secondi non chiude e rimanda tutto lo stesso.
 5. **Senza configurazione** (URL o segreto mancanti o non validi) l'invio aspetta e si riprova ogni
    ora, senza consumare tentativi; la nota d'ordine lo dice una volta sola.
    **Un invio per ordine alla volta**, per l'assegnazione e la revoca, con un lock del database: se
    lo stesso ordine è già in invio si riprova dopo un minuto, senza consumare tentativi. Se il lock
    non si può prendere (errore del database) o il nuovo tentativo non si programma, l'azione di
-   Action Scheduler fallisce senza toccare l'ordine, che compare fra gli invii interrotti (B15).
+   Action Scheduler fallisce senza toccare l'ordine, che resta in coda per la riconciliazione.
 6. Rimborso totale (stato "Rimborsato") o annullamento: accoda l'evento `licenze_revocate` con tutte
    le licenze RSCU dell'ordine. La revoca si registra anche se License Manager non ha ancora
    assegnato le licenze: quelle assegnate dopo si revocano subito dopo l'assegnazione. Su Raffaello
    Scuola la revoca è definitiva. Rimborso parziale: nessuna revoca automatica, solo una nota.
+   Marcatore di revoca e stato `in_coda` si scrivono insieme, sotto lo stesso lock della fotografia.
 7. Ogni ordine ha un **esito leggibile** e una nota d'ordine privata (vedi [Assistenza](#assistenza)).
+8. **Riconciliazione**: ogni ora un'azione di Action Scheduler (`rlb_riconcilia`, gruppo
+   `raffaello-scuola`, programmata dal plugin se manca e tolta alla disattivazione) cerca gli eventi
+   d'ordine `in_coda` da più di 30 minuti senza un'azione in attesa o in esecuzione: processo
+   fermato prima di programmare l'invio, job interrotto da un errore fatale o da un timeout, lock del
+   database non disponibile, azione annullata a mano. Li rimette in coda da sola e conta le riprese
+   (`_rscu_riprese_<evento>`, azzerate da un invio arrivato a Scuola e da "Reinvia"); alla quarta
+   volta l'evento diventa `fallito` con motivo `interrotto` e compare in B6. Scorre gli ordini a
+   pagine di 250 (al massimo 500 coppie ordine/evento per giro): la pagina dopo al giro dopo, poi
+   ricomincia. Salta gli ordini con un invio in corso. L'esito dell'ultimo giro è in B15.
+   Con le stesse regole riprende anche le fotografie senza stato dell'assegnazione e le revoche
+   senza stato (marcatore e fotografia, nessuno stato della revoca) degli ordini creati da più di
+   30 minuti: salvataggi interrotti a metà e ordini fotografati dal vecchio snippet.
 
 Esiti per licenza restituiti da Raffaello Scuola: `attivata`, `codice_libero` (quantità maggiore di
-1: il primo codice di ogni licenza va all'acquirente, gli altri restano codici liberi da regalare),
-`senza_destinatario`, `in_attesa_configurazione`, `revocata`, `conflitto`.
+1: il primo codice di ogni licenza va all'acquirente, gli altri restano codici liberi da regalare;
+per ora i prodotti RSCU si vendono singolarmente, vedi sotto), `senza_destinatario`,
+`in_attesa_configurazione`, `revocata`, `conflitto`.
 
 ## Requisiti
 
@@ -77,8 +99,9 @@ Esiti per licenza restituiti da Raffaello Scuola: `attivata`, `codice_libero` (q
   destinatario".
 - Su Raffaello Scuola: Raffaello Licenze 1.5.1 o successiva (1.5.0 riceve gli invii ma non conosce
   la prova di connessione).
-- Un solo server MySQL/MariaDB, come per Raffaello Licenze su Scuola: gli invii dello stesso ordine
-  si mettono in fila con un lock del database (`GET_LOCK`), che non vale fra server diversi.
+- Un solo server MySQL/MariaDB, come per Raffaello Licenze su Scuola: fotografia, revoca e invii
+  dello stesso ordine si mettono in fila con i lock del database (`GET_LOCK`, con il prefisso delle
+  tabelle nel nome: `wp_rlb_ordine_123`, `wp_rlb_foto_123`), che non valgono fra server diversi.
 - Compatibile con l'archivio ordini HPOS di WooCommerce e con quello classico su post (usa solo le
   API CRUD degli ordini).
 
@@ -106,9 +129,10 @@ plugin resta fermo, per non registrare due volte gli stessi ordini, e mostra un 
 L'ordine giusto: installa e configura il plugin, poi disattiva lo snippet. Fotografia
 (`_rscu_licenze`, `_rscu_cliente`), `_rscu_revocato`, azione e gruppo di Action Scheduler sono gli
 stessi: gli ordini già fotografati restano validi e gli invii già in coda li esegue il plugin.
-Tentativi ed esiti invece il plugin li tiene in chiavi sue, una per evento: gli ordini passati dallo
-snippet non compaiono fra gli invii falliti, e per quelli si usa "Reinvia licenze a Raffaello
-Scuola" sull'ordine.
+Tentativi ed esiti invece il plugin li tiene in chiavi sue, una per evento: gli ordini fotografati
+dallo snippet non hanno uno stato del plugin, e la riconciliazione li rimanda una volta a Scuola
+(fino a 250 ordini all'ora, Scuola è idempotente). Dopo ogni ordine ha esito e nota del plugin; se
+Scuola risponde con un esito da sistemare, l'ordine compare in B14.
 
 ## Configurazione del collegamento
 
@@ -175,7 +199,10 @@ La pagina del plugin mostra la checklist completa. Gli stessi controlli alimenta
 
 - un **avviso** in Bacheca e nelle pagine di WooCommerce (non nella pagina del plugin, che ha già
   la checklist), solo per i problemi **bloccanti**, senza pulsante di chiusura: sparisce da solo
-  quando il problema è risolto;
+  quando il problema è risolto. Per non rifare a ogni pagina le ricerche sugli ordini, l'avviso usa
+  un risultato tenuto 5 minuti, ricalcolato subito dopo il salvataggio delle impostazioni, la prova
+  di connessione, "Rimetti in coda", la conferma o una segnalazione di GreenBubble e ogni apertura
+  della pagina del plugin, che calcola sempre da zero;
 - un test in **Strumenti > Salute del sito** ("Licenze RSCU verso Raffaello Scuola"), che legge lo
   stato senza chiamate HTTP.
 
@@ -191,16 +218,16 @@ mai verde.
 | B3 | Collegamento | l'ultima prova o l'ultimo invio con la configurazione attuale è fallito (attenzione se mai provato, o se Scuola ha accettato la firma: ordine occupato, 400, Scuola senza ping) |
 | B4 | Chiamate HTTP in uscita | WordPress blocca l'host di Scuola |
 | B5 | Action Scheduler | ci sono invii scaduti da oltre 30 minuti e non eseguiti (WP-Cron fermo) |
-| B6 | Invii falliti | c'è almeno un ordine fallito (con i link, ultimi 50, e "Rimetti in coda gli invii falliti e interrotti") |
+| B6 | Invii falliti | c'è almeno un ordine fallito, compresi gli invii interrotti più di 3 volte (con i link, ultimi 50, e "Rimetti in coda gli invii falliti") |
 | B7 | Versione di License Manager | (attenzione se diversa dalla 3.0.20) |
 | B8 | Consegna delle licenze | né "In lavorazione" né "Completato" hanno "Send" (attenzione se ne manca uno o la consegna automatica è spenta) |
 | B9 | Generatore RSCU | non c'è un generatore con prefisso `RSCU` (attenzione se il prefisso non è `RSCU-` o le attivazioni non sono 1) |
-| B10 | Prodotti RSCU | (attenzione: nessun prodotto, o non virtuale, senza SKU, venduto singolarmente, "Sell license keys" o "Generate license keys" spenti, quantità consegnata maggiore di 1) |
+| B10 | Prodotti RSCU | (attenzione: nessun prodotto, o non virtuale, senza SKU, acquistabile in più copie, "Sell license keys" o "Generate license keys" spenti, quantità consegnata maggiore di 1) |
 | B11 | SKU su Scuola | l'ultima prova riuscita ha SKU sconosciuti a Scuola |
 | B12 | Identity e acquisti da ospite | Identity non attivo o acquisto da ospite permesso |
 | B13 | GreenBubble esclude le RSCU | una licenza RSCU è finita nelle meta di GreenBubble (attenzione: snippet che manda licenze altrove, non ancora confermato) |
 | B14 | Ordini da sistemare | (attenzione, con i link e i motivi) |
-| B15 | Invii interrotti | un'azione di Action Scheduler è fallita (per esempio per un errore fatale, un timeout o il lock del database) e l'ordine è ancora in coda, senza un'altra azione in attesa o in esecuzione (li conta tutti, ne elenca 50, con "Rimetti in coda gli invii falliti e interrotti") |
+| B15 | Riconciliazione | (verde con la data dell'ultimo giro, gli invii ripresi e quelli segnati falliti; attenzione se l'ultimo giro è di più di 2 ore fa o non ha mai girato) |
 
 ## License Manager: generatore, prodotti, consegna
 
@@ -213,7 +240,8 @@ License Manager > Generatori > Aggiungi:
 - Prefix: `RSCU-` (License Manager non mette il separatore dopo il prefisso: il trattino va nel
   prefisso). Le chiavi risultano come `RSCU-AB12-CD34`.
 - Maximum activation count: `1`
-- Expires in: i giorni di accesso (per esempio `365`)
+- Expires in: **vuoto**. Per ora i corsi non scadono: senza scadenza la licenza arriva a Scuola
+  illimitata. Se un giorno l'accesso dovrà durare un anno, qui vanno i giorni (per esempio `365`).
 
 ### Prodotto
 
@@ -221,8 +249,9 @@ License Manager > Generatori > Aggiungi:
   licenza su Raffaello Scuola.
 - Scheda "License Manager": "Sell license keys", "Generate license keys" con il generatore RSCU,
   "Delivered quantity" `1`.
-- Non "venduto singolarmente": la quantità può essere maggiore di 1 (i codici oltre il primo restano
-  liberi da regalare).
+- **Venduto singolarmente** (scheda "Inventario"): per ora i codici regalo non servono, quindi un
+  prodotto RSCU si compra in una copia sola. Il plugin e Scuola gestiscono anche le quantità
+  maggiori di 1 (i codici oltre il primo restano liberi da regalare), ma B10 lo segnala.
 
 ### Consegna
 
@@ -325,14 +354,13 @@ catalogo" non basta (il prodotto si compra lo stesso dal link diretto): vanno cr
    (o confronta solo il prodotto di prova del passo 6).
 6. **Ordine di prova**, con un **prodotto di prova dedicato**, perché i prodotti RSCU veri, privati
    o in bozza, un cliente non amministratore non li può comprare:
-   - sul Bookshop un prodotto di prova pubblicato ma **nascosto dal catalogo**, con il generatore
-     `RSCU-` e uno SKU suo; su Raffaello Scuola una **licenza di prova** con quello SKU e un
-     contenuto;
+   - sul Bookshop un prodotto di prova pubblicato ma **nascosto dal catalogo**, venduto
+     singolarmente, con il generatore `RSCU-` e uno SKU suo; su Raffaello Scuola una **licenza di
+     prova** con quello SKU e un contenuto;
    - un utente **non amministratore**, con Identity, lo compra dal checkout con il coupon
-     `SCONTO100` (stato test) e quantità 2: nota d'ordine "Raffaello Scuola, assegnazione riuscita …"
-     con una licenza `attivata` e un `codice_libero`, su Scuola l'attivazione (Licenze >
-     Attivazioni, ricerca per ordine) e il contenuto visibile all'utente; B13 non deve diventare
-     rosso;
+     `SCONTO100` (stato test): nota d'ordine "Raffaello Scuola, assegnazione riuscita …" con la
+     licenza `attivata`, su Scuola l'attivazione (Licenze > Attivazioni, ricerca per ordine) e il
+     contenuto visibile all'utente; B13 non deve diventare rosso;
    - poi il **rimborso totale**: nota "revoca riuscita", attivazione revocata, contenuto non più
      visibile;
    - finita la prova, prodotto e licenza di prova diventano privati o si eliminano.
@@ -361,11 +389,11 @@ ricerche; `_rscu_tentativi_…`). Per un ordine revocato conta la revoca:
 
 | Stato | Che cosa vuol dire | Che cosa fare |
 |---|---|---|
-| `in_coda` | Invio in attesa, oppure un tentativo non riuscito e il prossimo programmato, oppure collegamento non configurato | Niente, se la checklist è a posto |
+| `in_coda` | Invio in attesa, oppure un tentativo non riuscito e il prossimo programmato, oppure collegamento non configurato, oppure invio interrotto che la riconciliazione riprende entro un'ora | Niente, se la checklist è a posto |
 | `attivato` | Scuola ha attivato l'accesso per l'acquirente | Niente |
 | `inviato` | Ricevuto da Scuola senza attivazioni da fare (revoca riuscita, o licenze già revocate) | Niente |
 | `da_sistemare` | Ricevuto, ma serve un intervento: il motivo è nell'esito e nella nota | Vedi sotto |
-| `fallito` | Tentativi esauriti o errore definitivo | Correggere la causa (nota d'ordine), poi "Rimetti in coda gli invii falliti" o "Reinvia" sull'ordine |
+| `fallito` | Tentativi esauriti, errore definitivo, o invio interrotto più di 3 volte (motivo `interrotto`: errore fatale, timeout, lock del database; il log dice quale) | Correggere la causa (nota d'ordine), poi "Rimetti in coda gli invii falliti" o "Reinvia" sull'ordine |
 
 Motivi da sistemare:
 
@@ -387,9 +415,17 @@ Azioni:
 
 - **Reinvia licenze a Raffaello Scuola** (menu "Azioni ordine" degli ordini con licenze RSCU):
   rimette in coda gli stessi dati fotografati, e la revoca se l'ordine è stato revocato, con i
-  tentativi azzerati. Su Scuola l'invio è idempotente.
-- **Rimetti in coda gli invii falliti e interrotti** (pagina del plugin, B6 e B15): lo stesso per gli
-  ultimi 50 ordini falliti e per tutti gli ordini con un invio interrotto.
+  tentativi e le riprese azzerati. Su Scuola l'invio è idempotente.
+- **Rimetti in coda gli invii falliti** (pagina del plugin, B6): lo stesso per gli ultimi 50 ordini
+  falliti, compresi quelli interrotti più di 3 volte.
+- **Recupera le licenze RSCU da License Manager** (menu "Azioni ordine", con License Manager attivo,
+  sugli ordini con prodotti che vendono licenze): rilegge da License Manager le licenze dell'ordine
+  (la stessa ricerca per ordine che License Manager fa prima del suo hook), fotografa le RSCU che
+  mancano e rimette in coda l'invio di tutte, con la revoca se l'ordine è stato revocato. Non
+  rilancia l'hook di License Manager, quindi GreenBubble non riparte. Quando usarla: il cliente ha
+  ricevuto la chiave RSCU da License Manager (email, Il mio account) ma l'ordine non ha la nota
+  "Raffaello Scuola, …" né un esito; oppure ordini venduti prima di installare o configurare il
+  plugin. La nota d'ordine dice quante licenze ha recuperato.
 - **Rimborso parziale**: nessuna revoca automatica (la nota d'ordine lo ricorda). Per le licenze
   rimborsate, su Scuola:
   - codice già riscattato: si revoca l'attivazione (Licenze > Attivazioni, ricerca per ordine);
@@ -398,28 +434,32 @@ Azioni:
 ## Monitoraggio
 
 - **Chi e quando**: una persona dell'assistenza (da indicare prima del go-live) guarda la checklist,
-  in particolare **B6** (invii falliti), **B15** (invii interrotti) e **B14** (ordini da sistemare), ogni
+  in particolare **B6** (invii falliti), **B15** (riconciliazione) e **B14** (ordini da sistemare), ogni
   giorno lavorativo, e più volte al giorno nei primi giorni di vendita. I bloccanti compaiono anche
   come avviso in Bacheca e nelle pagine WooCommerce.
 - **Tentativi**: gli errori di rete, di configurazione e di Scuola consumano tentativi, e un invio
   si ritenta per circa 8 ore e mezza (5 tentativi): un guasto più lungo lascia gli ordini fra gli
   invii falliti (B6). Non consumano tentativi il collegamento non configurato (si riprova ogni ora)
   e l'attesa di un altro invio dello stesso ordine (si riprova dopo un minuto). Un invio rimasto
-  senza job, perché la sua azione di Action Scheduler è fallita (errore fatale, timeout, lock del
-  database), compare fra gli invii interrotti (B15). Corretta la causa: "Rimetti in coda gli invii
-  falliti e interrotti".
-- **Invii interrotti e conservazione**: Action Scheduler cancella le azioni fallite dopo 3 mesi
-  (filtri `action_scheduler_retention_period_for_failed` e
-  `action_scheduler_enable_failed_action_cleanup`). Un invio interrotto e non ripreso entro 3 mesi
-  sparisce da B15, ma l'ordine resta "in coda" e si recupera con "Reinvia licenze a Raffaello
-  Scuola" sull'ordine. Lo stesso vale se un invio in attesa viene annullato a mano in WooCommerce >
-  Stato > Azioni programmate: senza un'azione fallita B15 non lo vede, e l'ordine si riprende con
-  "Reinvia".
+  senza job (errore fatale, timeout, lock del database, azione annullata a mano in WooCommerce >
+  Stato > Azioni programmate) lo riprende la riconciliazione entro un'ora, al massimo 3 volte; poi
+  risulta fallito (B6, motivo `interrotto`). Nel log, sorgente `raffaello-scuola-licenze`, ogni
+  ripresa è un avviso "ripreso (n di 3)": riprese frequenti vogliono dire un problema da cercare
+  nei log di PHP.
+- **Riconciliazione ferma**: se B15 dice che l'ultimo giro è di più di 2 ore fa, Action Scheduler
+  non sta girando (vedi anche B5) o l'azione `rlb_riconcilia` è stata annullata: il plugin la
+  riprogramma alla prima pagina di amministrazione.
 - **Sospendere le vendite RSCU** in caso di guasto prolungato: si rendono privati i prodotti RSCU.
 - **Wordfence**: l'allowlist dell'IP del Bookshop va messa solo se il blocco è stato individuato
   (Traffico dal vivo), non per precauzione.
 
 ## Limiti noti
+
+- Un processo che si ferma dopo che License Manager ha consegnato le licenze ma prima della
+  fotografia non lascia traccia nell'ordine: License Manager ha già segnato l'ordine come completo e
+  il suo hook non ripassa. Non si recupera da solo: serve "Recupera le licenze RSCU da License
+  Manager" sull'ordine. Lo stesso per una fotografia aggiornata a metà (licenze nuove scritte, stato
+  rimasto quello del primo invio): l'azione rimanda tutta la fotografia.
 
 - Le modifiche fatte direttamente in License Manager (licenza disattivata o cancellata, chiave
   rigenerata) non arrivano a Raffaello Scuola: si revoca a mano.
@@ -434,8 +474,10 @@ Azioni:
 - Per un ordine revocato conta la revoca: un'assegnazione fallita seguita da una revoca riuscita
   non compare fra gli invii falliti. Il dettaglio dei due eventi resta nelle meta dell'ordine e
   nelle note.
-- Il plugin, se lo si disattiva, lascia le sue opzioni (`rlb_impostazioni`, `rlb_ping`,
-  `rlb_ultimo_invio`, `rlb_greenbubble`) e le meta d'ordine.
+- Il plugin, se lo si disattiva, toglie la riconciliazione da Action Scheduler e lascia le sue
+  opzioni (`rlb_impostazioni`, `rlb_ping`, `rlb_ultimo_invio`, `rlb_greenbubble`,
+  `rlb_riconciliazione`, `rlb_riconciliazione_pagina`), il transient `rlb_bloccanti` e le meta
+  d'ordine.
 
 ## Rilascio
 

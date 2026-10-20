@@ -72,6 +72,7 @@ class GreenBubble
         $ordini = array_unique(array_merge([$order->get_id()], $stato['rilevato']['ordini'] ?? []));
         $stato['rilevato'] = ['quando' => time(), 'ordini' => array_slice($ordini, 0, 50)];
         update_option(self::OPTION, $stato, false);
+        Checks::invalidate();
     }
 
     /**
@@ -140,14 +141,13 @@ class GreenBubble
         }, $snippets)));
     }
 
-    /** Voce B13 della checklist; 'conferma' è l'hash da confermare, se serve una conferma. */
-    public static function check(): array
+    /** Voce B13 della checklist, dagli snippet letti da Checks; 'conferma' è l'hash da confermare, se serve una conferma. */
+    public static function check(?array $snippets): array
     {
         $titolo = __('GreenBubble esclude le RSCU', 'raffaello-licenze-bookshop');
         $stato = self::stato();
         $conferma = $stato['conferma'] ?? null;
         $rilevato = $stato['rilevato'] ?? null;
-        $snippets = self::snippets();
         $sospetti = self::sospetti($snippets ?? []);
         $hash = self::hash($sospetti);
 
@@ -198,6 +198,7 @@ class GreenBubble
         $stato = self::stato();
         $stato['conferma'] = ['hash' => $hash, 'quando' => time(), 'utente' => get_current_user_id()];
         update_option(self::OPTION, $stato, false);
+        Checks::invalidate();
         return true;
     }
 
